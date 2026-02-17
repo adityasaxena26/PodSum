@@ -1,0 +1,22 @@
+# Podcast Summarizer MVP - Tier 1 (Platform Transcripts)
+# Minimal dependencies for working product
+
+# ===================
+# Transcript Fetching (Tier 1 - FREE & Instant)
+# ===================
+youtube-transcript-api>=0.6.0   # YouTube captions - no API key needed!
+
+# ===================
+# LLM Summarization
+# ===================
+groq>=0.4.0                     # Groq API (free tier available)
+
+# ===================
+# Utilities
+# ===================
+python-dotenv>=1.0.0            # Environment variables
+
+# ===================
+# UI (Optional - for web interface)
+# ===================
+gradio>=4.0.0                   # Simple web UI
