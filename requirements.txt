@@ -1,22 +1,38 @@
-# Podcast Summarizer MVP - Tier 1 (Platform Transcripts)
-# Minimal dependencies for working product
+# Podcast Summarizer v2.0 - Tier 2 (Multi-Platform + Audio Fallback)
+# Supports: YouTube, Spotify, and 1000+ sites via yt-dlp
 
 # ===================
-# Transcript Fetching (Tier 1 - FREE & Instant)
+# TIER 1: Platform Transcripts (Try First - FREE & Instant)
 # ===================
-youtube-transcript-api>=0.6.0   # YouTube captions - no API key needed!
+youtube-transcript-api>=0.6.0   # YouTube captions
+
+# ===================
+# TIER 2: Audio Fallback (When No Transcript Available)
+# ===================
+yt-dlp>=2024.1.0                # Download from 1000+ sites
+faster-whisper>=1.0.0           # Fast transcription (4x faster than OpenAI Whisper)
+torch>=2.0.0                    # PyTorch for Whisper
+pydub>=0.25.1                   # Audio processing
 
 # ===================
 # LLM Summarization
 # ===================
-groq>=0.4.0                     # Groq API (free tier available)
+google-genai>=1.0.0             # Google Gemini API (recommended, 1M token context)
+groq>=0.4.0                     # Groq API (Llama 3.1, fallback)
 
 # ===================
 # Utilities
 # ===================
 python-dotenv>=1.0.0            # Environment variables
+tqdm>=4.65.0                    # Progress bars
+httpx>=0.24.0                   # HTTP client
 
 # ===================
-# UI (Optional - for web interface)
+# Optional: Prosody Analysis (Tier 2+)
 # ===================
-gradio>=4.0.0                   # Simple web UI
+# librosa>=0.10.0               # Audio feature extraction (uncomment if needed)
+
+# ===================
+# UI
+# ===================
+gradio>=4.0.0                   # Web interface

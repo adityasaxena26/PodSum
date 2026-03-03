@@ -1,241 +1,304 @@
-# 🎙️ Podcast Summarizer MVP
+# Podcast Summarizer v2.0
 
-> **Tier 1 Implementation:** YouTube transcripts → AI Summary  
-> **Cost:** FREE | **Speed:** Instant | **GPU:** Not needed!
+> Multi-platform video & podcast summarizer with intelligent fallback and dual LLM support.
 
----
-
-## ✨ What This Does
-
-1. **Fetches** existing YouTube captions (no audio download!)
-2. **Summarizes** using Llama 3.1 70B via Groq (free tier)
-3. **Outputs** structured summary with takeaways, chapters, quotes
-
-```
-YouTube URL → Transcript (free, instant) → AI Summary → Markdown
-```
+Summarize content from **YouTube, Vimeo, Twitter, TikTok, Spotify, and 1000+ more sites** using AI. Supports both **Google Gemini** (recommended) and **Groq** as LLM providers.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
-### 1. Install Dependencies
+### 1. Install
 
-```bash
-pip install youtube-transcript-api groq python-dotenv
-```
-
-Or:
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Get Groq API Key (FREE)
+### 2. Set API Key
 
-1. Go to [console.groq.com/keys](https://console.groq.com/keys)
-2. Create a free account
-3. Generate an API key
-4. Set it:
+**Option A — Google Gemini (recommended):**
+
+Get a free key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+
+```bash
+export GEMINI_API_KEY='your-key-here'
+```
+
+**Option B — Groq:**
+
+Get a free key at [console.groq.com](https://console.groq.com/keys)
 
 ```bash
 export GROQ_API_KEY='your-key-here'
 ```
 
-### 3. Run It!
+Or add them to a `.env` file in the project root.
+
+### 3. Run
 
 ```bash
-# Basic usage
-python main.py https://www.youtube.com/watch?v=VIDEO_ID
+# YouTube video (uses captions — instant)
+python -m src.main https://www.youtube.com/watch?v=VIDEO_ID
 
-# Quick summary (shorter output)
-python main.py VIDEO_ID --style quick
+# Any supported site
+python -m src.main https://vimeo.com/123456789
 
-# Save to file
-python main.py VIDEO_ID --output summary.md
+# Local file
+python -m src.main --file podcast.mp3
 
-# Just get transcript (no API key needed)
-python main.py VIDEO_ID --transcript-only
+# Save output
+python -m src.main URL --output summary.md
+```
+
+**Web UI:**
+```bash
+python -m src.app
+# Open http://localhost:7860
 ```
 
 ---
 
-## 📖 Usage Examples
+## LLM Providers
 
-### CLI
+The app auto-selects the best available provider, or you can force one with `--provider`:
+
+| Provider | Model | Context Window | Speed | Free Tier | Notes |
+|----------|-------|---------------|-------|-----------|-------|
+| **Gemini** | `gemini-2.5-flash-lite` | 1M tokens | Fast | 15 RPM, 1M TPM | Handles 4+ hour podcasts in a single call |
+| **Groq** | `llama-3.3-70b-versatile` (primary) / `llama-3.1-8b-instant` (chunked) | 128K tokens | Fast | 6K TPM | Uses chunked processing for long content |
 
 ```bash
-# Full detailed summary
-python main.py https://www.youtube.com/watch?v=dQw4w9WgXcQ
+# Auto-select (default — prefers Gemini)
+python -m src.main URL
 
-# Quick summary (executive summary + takeaways only)
-python main.py dQw4w9WgXcQ --style quick
-
-# Chapter breakdown
-python main.py dQw4w9WgXcQ --style chapters
-
-# Bullet points only
-python main.py dQw4w9WgXcQ --style bullets
-
-# Save output
-python main.py dQw4w9WgXcQ -o my_summary.md
-
-# Custom title
-python main.py dQw4w9WgXcQ --title "My Favorite Video"
-
-# Get transcript without summarizing (no API key needed)
-python main.py dQw4w9WgXcQ --transcript-only
+# Force a specific provider
+python -m src.main URL --provider gemini
+python -m src.main URL --provider groq
 ```
 
-### Python API
+If Gemini quota is exhausted, the app automatically falls back to Groq.
+
+---
+
+## CLI Options
+
+```bash
+python -m src.main <URL> [options]
+
+Options:
+  --format FORMAT        Summary format: detailed, quick, bullets, chapters (default: detailed)
+  --output FILE, -o      Save to file (.md or .json)
+  --file FILE, -f        Summarize a local audio/video file
+  --title TITLE, -t      Custom title override
+  --provider PROVIDER    LLM provider: auto, gemini, groq (default: auto)
+  --force-audio          Skip platform captions, use Whisper
+  --transcript-only      Only fetch transcript, no summarization
+  --whisper-model MODEL  Whisper model: tiny, base, small, medium, large-v2, large-v3 (default: large-v3)
+  --quiet, -q            Minimal output
+```
+
+### Examples
+
+```bash
+# Quick summary
+python -m src.main URL --format quick
+
+# Bullet points saved to file
+python -m src.main URL --format bullets --output notes.md
+
+# JSON output
+python -m src.main URL --output data.json
+
+# Transcript only (no API key needed)
+python -m src.main URL --transcript-only
+
+# Force audio transcription with a smaller Whisper model
+python -m src.main URL --force-audio --whisper-model small
+```
+
+---
+
+## Python API
 
 ```python
-from main import PodcastSummarizerApp
+from src.main import PodcastSummarizerV2
 
-# Initialize
-app = PodcastSummarizerApp()
+app = PodcastSummarizerV2()
 
-# Summarize
-result = app.summarize_url(
-    url="https://www.youtube.com/watch?v=VIDEO_ID",
-    style="detailed"
-)
+# Summarize a URL
+result = app.summarize_url("https://youtube.com/watch?v=...", format="detailed")
 
 if result['success']:
     summary = result['summary']
     print(summary.executive_summary)
-    
     for takeaway in summary.key_takeaways:
-        print(f"• {takeaway}")
+        print(f"- {takeaway}")
+
+# Summarize a local file
+result = app.summarize_file("podcast.mp3", format="quick")
+
+# Export as markdown
+markdown = app.format_markdown(result['transcript'], result['summary'])
 ```
 
 ---
 
-## 📊 Summary Styles
+## Supported Platforms
 
-| Style | What You Get | Best For |
-|-------|--------------|----------|
-| `detailed` | Everything - summary, takeaways, chapters, quotes | Deep analysis |
-| `quick` | Summary + takeaways only | Quick overview |
-| `bullets` | Just key points as bullets | Skimming |
-| `chapters` | Chapter breakdown with timestamps | Navigation |
+**Tier 1 — Platform Transcripts (free, instant):**
+- YouTube (captions API)
+
+**Tier 2 — Audio Download + Whisper (fallback):**
+- Vimeo, Twitter/X, TikTok, Spotify, SoundCloud, Twitch, Facebook, Instagram, Dailymotion, and 1000+ more via yt-dlp
+
+**Local Files:**
+- Audio: MP3, WAV, M4A, FLAC, OGG
+- Video: MP4, MKV, WebM, AVI
+- Any format supported by FFmpeg
 
 ---
 
-## 📁 Project Structure
+## Summary Formats
+
+| Format | Output | Best For |
+|--------|--------|----------|
+| `detailed` | Full summary, chapters, quotes, takeaways | Deep analysis |
+| `quick` | Executive summary + key takeaways | Quick overview |
+| `bullets` | Key points as bullet list | Scanning |
+| `chapters` | Timeline with chapter breakdown | Navigation |
+
+---
+
+## Content Type Detection
+
+The summarizer auto-detects content type and adapts its output:
+
+| Type | Focus Areas |
+|------|-------------|
+| Podcast | Host/guest dynamics, main topics |
+| Interview | Interviewee insights, quotes |
+| Tutorial | Steps, concepts, how-to |
+| Lecture | Theories, definitions, examples |
+| News | Facts, sources, implications |
+| Commentary | Opinions, arguments, perspectives |
+| Entertainment | Highlights, moments, reactions |
+| General | Main points, key takeaways |
+
+---
+
+## How It Works
 
 ```
-podcast-summarizer-mvp/
-├── main.py                           # CLI and main app
-├── requirements.txt                  # Dependencies
-├── README.md                         # This file
-│
+INPUT: URL or local file
+         |
+         v
+  TIER 1: Platform Check
+  YouTube? -> Fetch captions (free, instant)
+         |
+     Found? --YES--> SUMMARIZE
+         |
+        NO
+         v
+  TIER 2: Audio Fallback
+  1. Download audio (yt-dlp)
+  2. Transcribe (faster-whisper)
+         |
+         v
+  SUMMARIZE
+  1. Detect content type
+  2. Gemini: single call (1M context)
+     Groq: chunked processing if needed
+         |
+         v
+  OUTPUT: Markdown / JSON
+  Summary, chapters, quotes, takeaways
+```
+
+---
+
+## Project Structure
+
+```
+PodsumV2/
 ├── src/
+│   ├── main.py                    # CLI application
+│   ├── app.py                     # Gradio web UI
 │   ├── ingestion/
-│   │   └── youtube_transcript.py     # YouTube transcript fetcher
-│   │
+│   │   └── multi_platform.py      # Multi-platform transcript fetcher
 │   └── summarization/
-│       └── summarizer.py             # LLM summarizer
-│
-└── outputs/                          # Your saved summaries
+│       └── summarizer.py          # LLM summarizer (Gemini + Groq)
+├── requirements.txt
+├── .env                           # API keys
+└── README.md
 ```
 
 ---
 
-## 🎯 Output Example
+## Configuration
 
-```markdown
-# My Podcast Summary
+### Environment Variables
 
-**Video ID:** dQw4w9WgXcQ
-**Duration:** 15.2 minutes
-**Language:** en
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GEMINI_API_KEY` | One of these | Google Gemini API key (recommended) |
+| `GROQ_API_KEY` | is required | Groq API key (fallback) |
 
----
+### Whisper Models
 
-## Executive Summary
+| Model | Speed | Accuracy | RAM |
+|-------|-------|----------|-----|
+| `tiny` | Fastest | Low | ~1GB |
+| `base` | Fast | Medium | ~1GB |
+| `small` | Medium | Good | ~2GB |
+| `medium` | Slow | High | ~5GB |
+| `large-v3` | Slowest | Best | ~5GB |
 
-This podcast discusses the fundamentals of machine learning...
-[2-3 paragraphs]
-
----
-
-## Key Takeaways
-
-1. Start with the fundamentals before diving into advanced topics
-2. Practice is more important than theory
-3. ...
+CLI default: `large-v3` | Web UI default: `base`
 
 ---
 
-## Chapters
+## Cost
 
-### [00:00] Introduction
-Brief overview of what will be covered...
-
-### [03:45] Main Topic
-Deep dive into the core concepts...
-
----
-
-## Notable Quotes
-
-> "The best way to learn is by doing"
-> *On the importance of hands-on practice*
+| Component | Cost |
+|-----------|------|
+| YouTube transcripts | Free |
+| Audio download (yt-dlp) | Free |
+| Whisper transcription | Free (local) |
+| Gemini API | Free tier available |
+| Groq API | Free tier available |
 
 ---
 
-## Topics
+## Troubleshooting
 
-`machine learning` • `python` • `data science`
+**"No API key set"** — Set at least one:
+```bash
+export GEMINI_API_KEY='your-key'   # or
+export GROQ_API_KEY='your-key'
 ```
 
----
+**"Gemini quota exhausted"** — The app auto-falls back to Groq. Or wait for daily quota reset.
 
-## ⚡ Why Tier 1?
+**"No transcript available"** — The app automatically falls back to audio download + Whisper transcription.
 
-| Approach | Speed | Cost | Compute |
-|----------|-------|------|---------|
-| **Tier 1 (This!)** | ~5 seconds | FREE | None |
-| Tier 2 (Audio) | ~5 minutes | GPU time | High |
+**"FFmpeg not found"** — Install it:
+```bash
+# macOS
+brew install ffmpeg
 
-We use YouTube's existing transcripts instead of downloading audio and running Whisper. Same result, 60x faster, zero compute cost!
+# Ubuntu/Debian
+sudo apt install ffmpeg
+```
 
----
+**"CUDA out of memory"** — Use a smaller Whisper model:
+```bash
+python -m src.main URL --whisper-model small
+```
 
-## 🔜 Coming in Tier 2
-
-- [ ] Audio fallback (when no transcript available)
-- [ ] Speaker diarization
-- [ ] Prosody analysis (emphasis, emotion)
-- [ ] Spotify, Apple Podcasts support
-- [ ] Web UI
-
----
-
-## 🐛 Troubleshooting
-
-**"No transcript available"**
-- Some videos have captions disabled
-- Try another video, or wait for Tier 2 (audio fallback)
-
-**"GROQ_API_KEY not set"**
-- Get free key at [console.groq.com](https://console.groq.com)
-- Run: `export GROQ_API_KEY='your-key'`
-
-**"Rate limited"**
-- Groq free tier: ~30 requests/minute
-- Wait a minute and try again
-
-**JSON parsing errors**
-- Usually resolves on retry
-- The code automatically retries 3 times
+**Slow summarization on Groq** — Groq's free tier has tight rate limits (6K TPM), requiring delays between chunks for long podcasts. Use Gemini instead, or upgrade to Groq's Dev tier.
 
 ---
 
-## 📄 License
+## License
 
-MIT - Do whatever you want with it!
-
----
-
-**Built for learning, shipped for using 🚀**
+MIT
