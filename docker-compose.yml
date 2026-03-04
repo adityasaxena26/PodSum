@@ -1,0 +1,57 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7860:7860"
+
+    # API keys — loaded from your local .env file.
+    # In production (GCP), inject these from Cloud Secret Manager instead.
+    env_file:
+      - .env
+
+    environment:
+      # Override Whisper model at runtime without rebuilding.
+      # The 'small' model is pre-baked into the image; switching to a larger
+      # model here will trigger a download on first request.
+      WHISPER_MODEL: "small"
+
+      # Temp audio files land here. The named volume below prevents
+      # filling the container's root filesystem on large audio files.
+      TMPDIR: /tmp/podsum
+
+    volumes:
+      # Persist the HuggingFace model cache across container restarts.
+      # Without this, any model not baked into the image re-downloads every run.
+      - whisper_cache:/app/.cache/huggingface
+
+      # Dedicated tmp space for downloaded audio files.
+      # Keeps large files off the container's root overlay filesystem.
+      - podsum_tmp:/tmp/podsum
+
+    restart: unless-stopped
+
+    # Resource caps — prevents a single runaway job from taking down the host.
+    # Whisper 'small' on CPU peaks at ~1.5GB RAM; bump if switching to large-v3.
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+        reservations:
+          memory: 1g
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:7860/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+volumes:
+  # Named volume for Whisper / HuggingFace model files (~500MB for 'small').
+  # docker volume inspect podsum_whisper_cache  →  shows host path
+  whisper_cache:
+
+  # Named volume for temporary audio downloads.
+  podsum_tmp:
