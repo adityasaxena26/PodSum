@@ -115,7 +115,7 @@ class MultiPlatformFetcher:
     
     def __init__(
         self,
-        whisper_model: str = "large-v3",
+        whisper_model: str = "small",
         whisper_device: str = "auto",
         prefer_transcripts: bool = True,
         temp_dir: Optional[str] = None

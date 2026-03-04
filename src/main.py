@@ -75,7 +75,7 @@ class PodcastSummarizerV2:
         groq_api_key: Optional[str] = None,
         gemini_api_key: Optional[str] = None,
         provider: str = "auto",
-        whisper_model: str = "large-v3"
+        whisper_model: str = "small"
     ):
         """
         Initialize the application.
@@ -445,9 +445,9 @@ Environment Variables:
     )
     parser.add_argument(
         "--whisper-model",
-        default="large-v3",
+        default="small",
         choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
-        help="Whisper model for audio (default: large-v3)"
+        help="Whisper model for audio (default: small)"
     )
     parser.add_argument(
         "--provider",
