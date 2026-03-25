@@ -304,7 +304,7 @@ CRITICAL: Be specific — use real names, numbers, claims from the transcript. N
                 word_count = yt_transcript.word_count
                 logger.info(f"✅ Path A done ({word_count} words)")
 
-            # ── Path B: No transcript → video call (~40-50s) ────────
+            # ── Path B: No transcript → video summary only (~30-35s) ──
             else:
                 if progress_callback:
                     progress_callback("AI is watching the video...", 0.15)
@@ -314,28 +314,22 @@ CRITICAL: Be specific — use real names, numbers, claims from the transcript. N
                 video_part = genai.types.Part.from_uri(
                     file_uri=canonical_url, mime_type='video/*',
                 )
-                target_words = max(2000, int(duration_min * 50))
 
                 resp = client.models.generate_content(
                     model=MODEL,
                     contents=[
                         video_part,
-                        f"""Analyze this video. Return JSON with a structured summary AND detailed notes.
+                        f"""Summarize this video. Return JSON only.
 
 TITLE: {video_title}
 {f"DURATION: {duration_min:.0f}min" if duration_min else ""}
 
 {schema}
 
-EXTRA REQUIRED FIELD — "transcript_notes" (string):
-Write {target_words}+ words of detailed chronological notes covering the ENTIRE video.
-Not a summary — capture every topic, argument, story, quote, and data point discussed.
-Use direct quotes from speakers. Separate sections with \\n\\n.
-
-CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact words. JSON only, no markdown.""",
+CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact words.""",
                     ],
                     config=types.GenerateContentConfig(
-                        max_output_tokens=16384,
+                        max_output_tokens=4096,
                         temperature=0.2,
                     ),
                 )
@@ -354,12 +348,24 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
                 raw = re.sub(r'\s*```$', '', raw)
             summary_data = json.loads(raw)
 
-            # Path B: extract transcript_notes from JSON
+            # Path B: build transcript from chapters/summary (no verbatim available)
             if transcript_text is None:
-                transcript_text = summary_data.pop(
-                    'transcript_notes',
-                    summary_data.get('executive_summary', '')
-                )
+                parts = []
+                exec_sum = summary_data.get('executive_summary', '')
+                if exec_sum:
+                    parts.append(f"OVERVIEW\n{exec_sum}")
+                for ch in summary_data.get('chapters', []):
+                    if isinstance(ch, dict):
+                        ts = ch.get('timestamp', '')
+                        title_ch = ch.get('title', '')
+                        summ = ch.get('summary', '')
+                        parts.append(f"[{ts}] {title_ch}\n{summ}")
+                for q in summary_data.get('notable_quotes', []):
+                    if isinstance(q, dict):
+                        speaker = q.get('speaker', '')
+                        text_q = q.get('text', '')
+                        parts.append(f'"{text_q}" — {speaker}')
+                transcript_text = "\n\n".join(parts) if parts else exec_sum
                 word_count = len(transcript_text.split())
 
             # ── Build result objects ────────────────────────────────
