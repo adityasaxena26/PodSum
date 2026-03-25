@@ -415,50 +415,93 @@ class EnhancedSummarizer:
         return ContentType.GENERAL
 
     @staticmethod
-    def get_format_schema(format: 'SummaryFormat') -> str:
+    def get_format_schema(format: 'SummaryFormat', content_type: 'ContentType' = None) -> str:
         """Return the format-specific JSON schema for summary output.
 
         Extracted as a public method so it can be reused by the combined
         Gemini transcribe+summarize path in main.py.
         """
+        # Content-type specific focus (appended to any format)
+        ct_focus = ""
+        if content_type:
+            ct_map = {
+                ContentType.PODCAST: (
+                    "This is a PODCAST. Focus on: main discussion topics between "
+                    "hosts/guests, key opinions and perspectives, interesting anecdotes, "
+                    "and any disagreements or debates."
+                ),
+                ContentType.INTERVIEW: (
+                    "This is an INTERVIEW. Focus on: the interviewee's background and "
+                    "expertise, key insights and experiences shared, memorable quotes, "
+                    "and advice or recommendations given."
+                ),
+                ContentType.TUTORIAL: (
+                    "This is a TUTORIAL. Focus on: step-by-step instructions, key "
+                    "concepts explained, prerequisites, common mistakes to avoid, "
+                    "and tips/best practices."
+                ),
+                ContentType.LECTURE: (
+                    "This is a LECTURE. Focus on: main concepts and theories, key "
+                    "definitions and frameworks, examples and case studies, and "
+                    "connections between ideas."
+                ),
+                ContentType.NEWS: (
+                    "This is NEWS/COMMENTARY. Focus on: key facts and events, "
+                    "who/what/when/where/why, different perspectives, implications, "
+                    "and what remains unknown."
+                ),
+            }
+            ct_focus = ct_map.get(content_type, "")
+
         if format == SummaryFormat.QUICK:
-            return '''Return JSON:
+            schema = '''JSON schema:
 {
-    "executive_summary": "2-3 paragraphs",
-    "key_takeaways": ["5-7 key points"],
-    "topics": ["main topics"]
+    "executive_summary": "2-3 paragraphs: (1) what & why it matters, (2) main ideas with specifics, (3) conclusions",
+    "key_takeaways": ["5-7 concrete insights with names/numbers/examples — no vague generalities"],
+    "topics": ["specific topics"]
 }'''
         elif format == SummaryFormat.BULLETS:
-            return '''Return JSON:
+            schema = '''JSON schema:
 {
-    "key_takeaways": ["7-10 key points as complete sentences"]
+    "key_takeaways": ["7-10 self-contained insights. Each: one distinct point + concrete detail (who/what/number)."]
 }'''
         elif format == SummaryFormat.CHAPTERS:
-            return '''Return JSON:
+            schema = '''JSON schema (5-10 chapters following natural flow):
 {
-    "chapters": [
-        {"title": "Chapter Name", "timestamp": "MM:SS", "summary": "Description"}
-    ],
-    "executive_summary": "Brief overview"
+    "chapters": [{"title": "Name", "timestamp": "MM:SS", "summary": "2-3 sentences with specific points"}],
+    "executive_summary": "1-2 paragraph overview"
 }'''
         else:  # DETAILED
-            return '''Return JSON:
+            schema = '''JSON schema (5-10 chapters, 3-5 quotes, 5-8 topics):
 {
-    "executive_summary": "Comprehensive 2-3 paragraph summary",
-    "key_takeaways": [
-        "First key insight",
-        "Second key insight",
-        "Include 5-7 total"
-    ],
-    "chapters": [
-        {"title": "Section Title", "timestamp": "MM:SS", "summary": "What's covered"}
-    ],
-    "notable_quotes": [
-        {"text": "Exact quote", "speaker": "Who said it", "context": "Why notable"}
-    ],
-    "topics": ["topic1", "topic2"],
-    "action_items": ["Recommendations or calls to action mentioned"]
+    "executive_summary": "3 paragraphs: (1) context — who/what/why it matters, (2) main arguments/ideas with specific details, (3) conclusions/implications",
+    "key_takeaways": ["5-7 insights — each: '[Speaker/Source] argues/shows/recommends [specific claim] because [reason]'"],
+    "chapters": [{"title": "Section Name", "timestamp": "MM:SS", "summary": "2-3 sentences with specific points and examples"}],
+    "notable_quotes": [{"text": "exact words spoken", "speaker": "name", "context": "significance"}],
+    "topics": ["specific topic names"],
+    "action_items": ["specific recommendations or next steps mentioned"]
 }'''
+
+        if ct_focus:
+            schema += f"\n{ct_focus}"
+
+        return schema
+
+    @staticmethod
+    def detect_content_type_from_title(title: str) -> 'ContentType':
+        """Quick content-type detection from title alone (for fast path)."""
+        t = title.lower()
+        if any(w in t for w in ['interview', 'guest', 'conversation with', 'talks to']):
+            return ContentType.INTERVIEW
+        if any(w in t for w in ['podcast', 'episode', 'ep.', 'ep ']):
+            return ContentType.PODCAST
+        if any(w in t for w in ['tutorial', 'how to', 'guide', 'learn', 'course']):
+            return ContentType.TUTORIAL
+        if any(w in t for w in ['lecture', 'class', 'lesson']):
+            return ContentType.LECTURE
+        if any(w in t for w in ['news', 'breaking', 'update', 'report']):
+            return ContentType.NEWS
+        return ContentType.GENERAL
 
     def _build_prompt(
         self,
@@ -522,10 +565,10 @@ Focus on:
             content_type, content_instructions[ContentType.GENERAL]
         )
         
-        structure = self.get_format_schema(format)
+        structure = self.get_format_schema(format, content_type)
 
-        
-        return f"""You are an expert content summarizer. Analyze this {content_type.value} transcript.
+
+        return f"""You are an expert content analyst. Produce a high-quality, insightful summary of this {content_type.value} transcript.
 
 {"TITLE: " + title if title else ""}
 {"DURATION: " + f"{duration:.0f} minutes" if duration else ""}
@@ -538,12 +581,14 @@ TRANSCRIPT:
 
 {structure}
 
-RULES:
+QUALITY RULES:
 1. Return ONLY valid JSON - no markdown, no extra text
 2. Start with {{ and end with }}
-3. Be specific and detailed, not generic
-4. Include actual content from the transcript
-5. For quotes, use exact words from the transcript"""
+3. Be SPECIFIC: reference actual names, numbers, claims, and examples from the content
+4. NEVER use generic filler like "interesting discussion" or "various topics" — always state WHAT was discussed
+5. For executive_summary: explain what this is about, the key arguments/ideas, and why it matters
+6. For key_takeaways: each must be a standalone insight with concrete details
+7. For quotes: use EXACT words from the transcript, not paraphrases"""
     
     def _add_format_hint(self, prompt: str) -> str:
         """Add formatting hint after failed parse"""
