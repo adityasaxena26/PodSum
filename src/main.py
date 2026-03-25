@@ -208,16 +208,16 @@ class PodcastSummarizerV2:
         progress_callback=None,
     ) -> Optional[dict]:
         """
-        Transcribe AND summarize a YouTube video in a single Gemini API call.
+        Smart fast path for YouTube summarization.
 
-        Instead of:  video → Gemini(transcribe) → text → Gemini(summarize) → JSON
-        Does:        video → Gemini(transcribe+summarize) → JSON + transcript
+        Strategy (fastest first):
+        1. Try youtube-transcript-api (<1s) → text-only Gemini summary (~5-10s)
+        2. If transcript API fails (GCP): single Gemini video call for summary (~50s)
 
-        Returns the standard result dict, or None if the combined path fails
-        (so the caller falls back to the 2-step pipeline).
+        Never sends TWO video calls to Gemini — that was the old bottleneck.
         """
         import json, re
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
 
         try:
             from google import genai
@@ -229,13 +229,28 @@ class PodcastSummarizerV2:
         if not api_key:
             return None
 
-        # Extract video ID and get metadata via YouTube Data API v3
         video_id = self.fetcher._extract_youtube_id(url)
         if not video_id:
             return None
 
         canonical_url = f"https://www.youtube.com/watch?v={video_id}"
 
+        # ── Step 1: Try youtube-transcript-api (free, <1s) ──────────
+        if progress_callback:
+            progress_callback("Checking for captions...", 0.05)
+
+        yt_transcript = None
+        try:
+            yt_transcript = self.fetcher._fetch_youtube_transcript(url)
+            if yt_transcript and yt_transcript.success:
+                logger.info(
+                    f"Got transcript via youtube-transcript-api: "
+                    f"{yt_transcript.word_count} words"
+                )
+        except Exception as e:
+            logger.info(f"youtube-transcript-api failed: {e}")
+
+        # ── Step 2: Get metadata ────────────────────────────────────
         metadata = {}
         yt_api_key = os.environ.get('YOUTUBE_API_KEY')
         if yt_api_key:
@@ -247,97 +262,110 @@ class PodcastSummarizerV2:
         video_title = title or metadata.get('title', 'Untitled')
         duration = metadata.get('duration', 0)
         duration_min = duration / 60 if duration else 0
-
         schema = EnhancedSummarizer.get_format_schema(summary_format)
         client = genai.Client(api_key=api_key)
-        video_part = genai.types.Part.from_uri(
-            file_uri=canonical_url,
-            mime_type='video/*',
-        )
 
-        def _get_summary():
-            """Fast: ask Gemini for JSON summary only (~7-15s with flash-lite)."""
-            resp = client.models.generate_content(
-                model='gemini-2.5-flash-lite',
-                contents=[
-                    video_part,
-                    f"""Analyze this video and return a structured JSON summary.
+        try:
+            # ── Path A: Transcript available → text-only summary (~5-10s) ──
+            if yt_transcript and yt_transcript.success:
+                if progress_callback:
+                    progress_callback("Summarizing transcript with AI...", 0.3)
+
+                logger.info("Fast text-only Gemini summarization")
+
+                resp = client.models.generate_content(
+                    model='gemini-2.5-flash-lite',
+                    contents=f"""Analyze this transcript and return a structured JSON summary.
 
 VIDEO TITLE: {video_title}
 {"DURATION: " + f"{duration_min:.0f} minutes" if duration_min else ""}
+
+TRANSCRIPT:
+{yt_transcript.text}
 
 {schema}
 
 RULES:
 - Return ONLY valid JSON — no markdown fences, no commentary
 - Start with {{ and end with }}
+- Be specific and detailed, referencing actual content
+- For quotes, use exact words from the transcript""",
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=8192,
+                        temperature=0.3,
+                    ),
+                )
+                summary_raw = resp.text.strip()
+                transcript_text = yt_transcript.text
+                transcript_source = yt_transcript.source
+                word_count = yt_transcript.word_count
+                logger.info(f"✅ Text-only summary complete ({word_count} words)")
+
+            # ── Path B: No transcript → single Gemini video call (~50s) ──
+            else:
+                if progress_callback:
+                    progress_callback("Gemini is analyzing the video...", 0.15)
+
+                logger.info(f"Video-based Gemini summary: {canonical_url}")
+
+                video_part = genai.types.Part.from_uri(
+                    file_uri=canonical_url,
+                    mime_type='video/*',
+                )
+
+                # Single call: summary + condensed transcript in one response
+                resp = client.models.generate_content(
+                    model='gemini-2.5-flash-lite',
+                    contents=[
+                        video_part,
+                        f"""Watch this video and return a JSON response.
+
+VIDEO TITLE: {video_title}
+{"DURATION: " + f"{duration_min:.0f} minutes" if duration_min else ""}
+
+{schema}
+
+ALSO include this extra field in the JSON:
+"transcript_notes": "A detailed, chronological account of everything discussed in the video. Include key phrases and statements as spoken. This should be 500-1000 words covering the full video."
+
+RULES:
+- Return ONLY valid JSON — no markdown fences, no commentary
+- Start with {{ and end with }}
 - Be specific and detailed, referencing actual content from the video
 - For quotes, use exact words from the video""",
-                ],
-                config=types.GenerateContentConfig(
-                    max_output_tokens=8192,
-                    temperature=0.3,
-                ),
-            )
-            return resp.text.strip()
-
-        def _get_transcript():
-            """Fast: ask Gemini for verbatim transcript only (~7-15s with flash-lite)."""
-            resp = client.models.generate_content(
-                model='gemini-2.5-flash-lite',
-                contents=[
-                    video_part,
-                    (
-                        "Transcribe every word spoken in this video verbatim. "
-                        "Return ONLY the transcript text — no timestamps, "
-                        "no speaker labels, no commentary, no markdown."
+                    ],
+                    config=types.GenerateContentConfig(
+                        max_output_tokens=12288,
+                        temperature=0.3,
                     ),
-                ],
-                config=types.GenerateContentConfig(
-                    max_output_tokens=16384,
-                    temperature=0.1,
-                ),
-            )
-            return resp.text.strip()
-
-        try:
-            if progress_callback:
-                progress_callback("Gemini is watching the video...", 0.15)
-
-            logger.info(
-                f"Parallel Gemini calls: {canonical_url} "
-                f"(format={summary_format.value})"
-            )
-
-            # Fire both calls in parallel — each takes ~7-15s, total ~7-15s
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                summary_future = pool.submit(_get_summary)
-                transcript_future = pool.submit(_get_transcript)
-
-                if progress_callback:
-                    progress_callback("Transcribing & summarizing...", 0.4)
-
-                summary_raw = summary_future.result(timeout=120)
-                transcript_text = transcript_future.result(timeout=120)
+                )
+                summary_raw = resp.text.strip()
+                transcript_text = None  # will extract from JSON below
+                transcript_source = TranscriptSource.YOUTUBE_CAPTIONS
+                word_count = 0
 
             if progress_callback:
                 progress_callback("Parsing response...", 0.85)
 
-            # Parse summary JSON
+            # ── Parse summary JSON ──────────────────────────────────
             raw = summary_raw
             if raw.startswith('```'):
                 raw = re.sub(r'^```(?:json)?\s*', '', raw)
                 raw = re.sub(r'\s*```$', '', raw)
             summary_data = json.loads(raw)
 
-            if not transcript_text or len(transcript_text) < 50:
-                logger.warning("Combined Gemini: transcript too short")
-                return None
+            # If video path, extract transcript_notes from the JSON
+            if transcript_text is None:
+                transcript_text = summary_data.pop(
+                    'transcript_notes',
+                    summary_data.get('executive_summary', 'No transcript available.')
+                )
+                word_count = len(transcript_text.split())
 
             # Build TranscriptResult
             transcript_result = TranscriptResult(
                 success=True,
-                source=TranscriptSource.YOUTUBE_CAPTIONS,
+                source=transcript_source,
                 text=transcript_text,
                 segments=[],
                 title=video_title,
@@ -357,7 +385,7 @@ RULES:
                 notable_quotes=[],
                 topics=summary_data.get('topics', []),
                 action_items=summary_data.get('action_items', []),
-                word_count_original=len(transcript_text.split()),
+                word_count_original=word_count,
                 word_count_summary=len(
                     summary_data.get('executive_summary', '').split()
                 ),
@@ -391,8 +419,8 @@ RULES:
                 progress_callback("Complete!", 1.0)
 
             logger.info(
-                f"✅ Parallel Gemini complete: "
-                f"{transcript_result.word_count} words transcript, "
+                f"✅ Fast path complete: "
+                f"{transcript_result.word_count} words, "
                 f"{len(summary_result.key_takeaways)} takeaways"
             )
 
