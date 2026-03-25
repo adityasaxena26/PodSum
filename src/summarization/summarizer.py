@@ -44,6 +44,18 @@ class SummaryFormat(Enum):
     CHAPTERS = "chapters"
     EXECUTIVE = "executive"
 
+    @classmethod
+    def from_string(cls, name: str) -> 'SummaryFormat':
+        """Convert string name to SummaryFormat, defaulting to DETAILED."""
+        _map = {
+            "detailed": cls.DETAILED,
+            "quick": cls.QUICK,
+            "bullets": cls.BULLETS,
+            "chapters": cls.CHAPTERS,
+            "executive": cls.EXECUTIVE,
+        }
+        return _map.get(name, cls.DETAILED)
+
 
 @dataclass
 class Chapter:
@@ -648,9 +660,9 @@ IMPORTANT: Previous response had JSON errors.
         # Try direct parse
         try:
             return json.loads(text)
-        except:
+        except (json.JSONDecodeError, ValueError):
             pass
-        
+
         # Try extracting from markdown
         patterns = [
             r'```json\s*([\s\S]*?)\s*```',
@@ -661,9 +673,9 @@ IMPORTANT: Previous response had JSON errors.
             if match:
                 try:
                     return json.loads(match.group(1))
-                except:
+                except (json.JSONDecodeError, ValueError):
                     continue
-        
+
         # Try finding JSON object
         match = re.search(r'\{[\s\S]*\}', text)
         if match:
@@ -671,7 +683,7 @@ IMPORTANT: Previous response had JSON errors.
                 # Fix trailing commas
                 fixed = re.sub(r',\s*([}\]])', r'\1', match.group(0))
                 return json.loads(fixed)
-            except:
+            except (json.JSONDecodeError, ValueError):
                 pass
         
         return None
@@ -867,16 +879,9 @@ def summarize(
     Returns:
         Summary object
     """
-    format_map = {
-        "detailed": SummaryFormat.DETAILED,
-        "quick": SummaryFormat.QUICK,
-        "bullets": SummaryFormat.BULLETS,
-        "chapters": SummaryFormat.CHAPTERS,
-    }
-    
     summarizer = EnhancedSummarizer(**kwargs)
     return summarizer.summarize(
         transcript,
         title=title,
-        format=format_map.get(format, SummaryFormat.DETAILED)
+        format=SummaryFormat.from_string(format)
     )

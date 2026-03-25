@@ -134,6 +134,7 @@ class MultiPlatformFetcher:
         self.whisper_device = whisper_device
         self.prefer_transcripts = prefer_transcripts
         self.temp_dir = temp_dir or tempfile.gettempdir()
+        self.cookies_path = None  # Optional path to cookies.txt
         os.makedirs(self.temp_dir, exist_ok=True)
 
         # Lazy-loaded components
@@ -158,9 +159,19 @@ class MultiPlatformFetcher:
         Returns:
             TranscriptResult with transcript and metadata
         """
+        # Validate URL: reject non-HTTP schemes (file://, ftp://, etc.) to prevent SSRF
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return TranscriptResult(
+                success=False,
+                url=url,
+                error=f"Unsupported URL scheme: {parsed.scheme}. Only http:// and https:// are allowed."
+            )
+
         platform = self._detect_platform(url)
         logger.info(f"Detected platform: {platform.value}")
-        
+
         if progress_callback:
             progress_callback("Detecting platform", 0.05)
         
@@ -279,14 +290,14 @@ class MultiPlatformFetcher:
             try:
                 transcript = transcript_list.find_manually_created_transcript(['en', 'en-US', 'en-GB'])
                 is_auto = False
-            except:
+            except Exception:
                 pass
 
             if not transcript:
                 try:
                     transcript = transcript_list.find_generated_transcript(['en', 'en-US', 'en-GB'])
                     is_auto = True
-                except:
+                except Exception:
                     pass
 
             if not transcript:
@@ -916,8 +927,9 @@ class MultiPlatformFetcher:
                         follow_redirects=True,
                         headers={
                             "User-Agent": (
-                                "Mozilla/5.0 (compatible; Googlebot/2.1; "
-                                "+http://www.google.com/bot.html)"
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/120.0.0.0 Safari/537.36"
                             )
                         }
                     ) as client:
@@ -1188,7 +1200,7 @@ class MultiPlatformFetcher:
             if audio_path and os.path.exists(audio_path):
                 try:
                     os.remove(audio_path)
-                except:
+                except OSError:
                     pass
     
     def _get_ffmpeg_location(self) -> Optional[str]:
@@ -1348,7 +1360,7 @@ class MultiPlatformFetcher:
             try:
                 import torch
                 device = "cuda" if torch.cuda.is_available() else "cpu"
-            except:
+            except (ImportError, Exception):
                 device = "cpu"
         
         compute_type = "float16" if device == "cuda" else "int8"

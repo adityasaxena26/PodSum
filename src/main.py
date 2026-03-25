@@ -21,6 +21,7 @@ Version: 2.0.0
 import sys
 import os
 import argparse
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -50,7 +51,9 @@ from src.summarization.summarizer import (
     EnhancedSummarizer,
     Summary,
     SummaryFormat,
-    ContentType
+    ContentType,
+    Chapter,
+    Quote
 )
 
 groq_api_key = os.getenv("GROQ_API_KEY")
@@ -92,6 +95,10 @@ class PodcastSummarizerV2:
             gemini_api_key=gemini_api_key,
             provider=provider,
         )
+        # Simple result cache: {cache_key: result_dict}
+        # Avoids repeat API calls for same URL + format
+        self._cache = {}
+        self._cache_max = 32
     
     def summarize_url(
         self,
@@ -114,13 +121,15 @@ class PodcastSummarizerV2:
         Returns:
             dict with 'success', 'transcript', 'summary', 'error'
         """
-        format_map = {
-            "detailed": SummaryFormat.DETAILED,
-            "quick": SummaryFormat.QUICK,
-            "bullets": SummaryFormat.BULLETS,
-            "chapters": SummaryFormat.CHAPTERS,
-        }
-        summary_format = format_map.get(format, SummaryFormat.DETAILED)
+        summary_format = SummaryFormat.from_string(format)
+
+        # Check cache (same URL + format = same result)
+        cache_key = hashlib.md5(f"{url}|{format}|{force_audio}".encode()).hexdigest()
+        if cache_key in self._cache:
+            logger.info(f"Cache hit for {url}")
+            if progress_callback:
+                progress_callback("Complete! (cached)", 1.0)
+            return self._cache[cache_key]
 
         # Fast path: Combined Gemini transcribe + summarize in ONE API call.
         # When the URL is YouTube and Gemini is available, this avoids two
@@ -134,6 +143,7 @@ class PodcastSummarizerV2:
                 progress_callback("Transcribing & summarizing via Gemini...", 0.1)
             result = self._combined_gemini(url, summary_format, title, progress_callback)
             if result and result['success']:
+                self._cache_put(cache_key, result)
                 return result
             logger.info("Combined Gemini path failed, falling back to 2-step pipeline")
 
@@ -183,15 +193,25 @@ class PodcastSummarizerV2:
         if progress_callback:
             progress_callback("Complete!", 1.0)
 
-        return {
+        result = {
             'success': True,
             'transcript': transcript_result,
             'summary': summary_result
         }
-    
+        self._cache_put(cache_key, result)
+        return result
+
     # =================================================================
     # Combined Gemini fast path (single API call)
     # =================================================================
+
+    def _cache_put(self, key: str, value: dict):
+        """Store result in cache, evicting oldest if full."""
+        if len(self._cache) >= self._cache_max:
+            # Evict oldest entry
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+        self._cache[key] = value
 
     @staticmethod
     def _is_youtube_url(url: str) -> bool:
@@ -218,13 +238,11 @@ class PodcastSummarizerV2:
         import json, re
 
         try:
-            from google import genai
             from google.genai import types
         except ImportError:
             return None
 
-        api_key = os.environ.get('GEMINI_API_KEY')
-        if not api_key:
+        if not os.environ.get('GEMINI_API_KEY'):
             return None
 
         video_id = self.fetcher._extract_youtube_id(url)
@@ -268,7 +286,8 @@ class PodcastSummarizerV2:
         logger.info(f"Content type: {content_type.value}")
 
         schema = EnhancedSummarizer.get_format_schema(summary_format, content_type)
-        client = genai.Client(api_key=api_key)
+        # Reuse the summarizer's Gemini client (lazy-loaded singleton)
+        client = self.summarizer._get_gemini_client()
         MODEL = 'gemini-2.5-flash-lite'  # No thinking overhead, fast structured output
 
         try:
@@ -311,7 +330,7 @@ CRITICAL: Be specific — use real names, numbers, claims from the transcript. N
 
                 logger.info(f"Path B: video→{MODEL} ({canonical_url})")
 
-                video_part = genai.types.Part.from_uri(
+                video_part = types.Part.from_uri(
                     file_uri=canonical_url, mime_type='video/*',
                 )
 
@@ -400,23 +419,19 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
 
             for ch in summary_data.get('chapters', []):
                 if isinstance(ch, dict):
-                    summary_result.chapters.append(
-                        type('Chapter', (), {
-                            'title': ch.get('title', ''),
-                            'timestamp': ch.get('timestamp', ''),
-                            'summary': ch.get('summary', ''),
-                        })()
-                    )
+                    summary_result.chapters.append(Chapter(
+                        title=ch.get('title', ''),
+                        timestamp=ch.get('timestamp', ''),
+                        summary=ch.get('summary', ''),
+                    ))
 
             for q in summary_data.get('notable_quotes', []):
                 if isinstance(q, dict):
-                    summary_result.notable_quotes.append(
-                        type('Quote', (), {
-                            'text': q.get('text', ''),
-                            'speaker': q.get('speaker', ''),
-                            'context': q.get('context', ''),
-                        })()
-                    )
+                    summary_result.notable_quotes.append(Quote(
+                        text=q.get('text', ''),
+                        speaker=q.get('speaker', ''),
+                        context=q.get('context', ''),
+                    ))
 
             if progress_callback:
                 progress_callback("Complete!", 1.0)
@@ -478,17 +493,10 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
         if progress_callback:
             progress_callback("Generating summary...", 0.7)
         
-        format_map = {
-            "detailed": SummaryFormat.DETAILED,
-            "quick": SummaryFormat.QUICK,
-            "bullets": SummaryFormat.BULLETS,
-            "chapters": SummaryFormat.CHAPTERS,
-        }
-        
         summary_result = self.summarizer.summarize(
             transcript=transcript_result.text,
             title=title or Path(file_path).stem,
-            format=format_map.get(format, SummaryFormat.DETAILED),
+            format=SummaryFormat.from_string(format),
             duration_minutes=transcript_result.duration_minutes
         )
         
