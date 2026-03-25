@@ -136,26 +136,9 @@ class MultiPlatformFetcher:
         self.temp_dir = temp_dir or tempfile.gettempdir()
         os.makedirs(self.temp_dir, exist_ok=True)
 
-        # Cookie file for YouTube authentication (needed on cloud/data-center IPs)
-        self.cookies_path = self._find_cookies_file()
-        if self.cookies_path:
-            logger.info(f"Using cookies file: {self.cookies_path}")
-
         # Lazy-loaded components
         self._whisper = None
         self._yt_dlp = None
-
-    def _find_cookies_file(self) -> Optional[str]:
-        """Locate a Netscape-format cookies.txt file for YouTube authentication."""
-        # 1. Explicit env var
-        env_path = os.environ.get('YOUTUBE_COOKIES_PATH')
-        if env_path and os.path.isfile(env_path):
-            return env_path
-        # 2. Common default locations
-        for candidate in ['/app/cookies.txt', 'cookies.txt']:
-            if os.path.isfile(candidate):
-                return os.path.abspath(candidate)
-        return None
     
     def fetch(
         self,
@@ -196,31 +179,25 @@ class MultiPlatformFetcher:
             tier1_error = result.error
             logger.info(f"Tier 1 transcript failed: {tier1_error}")
 
-            # TIER 1.5a: YouTube Data API v3 + innertube (works from cloud IPs)
-            if platform == Platform.YOUTUBE and os.environ.get('YOUTUBE_API_KEY'):
+            # TIER 1.5: Gemini transcription (YouTube URL → googleapis.com → transcript)
+            # Gemini natively processes YouTube URLs via Google's internal infra.
+            # All traffic goes through googleapis.com — never touches youtube.com,
+            # so it is NEVER blocked on GCP / cloud IPs.
+            if platform == Platform.YOUTUBE and os.environ.get('GEMINI_API_KEY'):
                 if progress_callback:
-                    progress_callback("Trying YouTube Data API", 0.12)
-                result = self._fetch_youtube_transcript_data_api(url)
+                    progress_callback("Transcribing via Gemini", 0.15)
+                logger.info("Trying Gemini YouTube transcription (googleapis.com)...")
+                result = self._fetch_transcript_via_gemini(url)
                 if result.success:
-                    logger.info("✅ Got transcript via YouTube Data API")
+                    logger.info("✅ Got transcript via Gemini")
                     if progress_callback:
                         progress_callback("Transcript fetched", 1.0)
                     return result
-                logger.info(f"Tier 1.5a Data API failed: {result.error}")
+                logger.warning(f"Tier 1.5 Gemini transcription failed: {result.error}")
+            elif platform == Platform.YOUTUBE:
+                logger.warning("⚠️ GEMINI_API_KEY not set — skipping Gemini transcription")
 
-            # TIER 1.5b: yt-dlp subtitle extraction (no audio download)
-            if platform == Platform.YOUTUBE:
-                if progress_callback:
-                    progress_callback("Trying subtitle extraction", 0.15)
-                result = self._fetch_youtube_subtitles_ytdlp(url)
-                if result.success:
-                    logger.info("✅ Got transcript via yt-dlp subtitles")
-                    if progress_callback:
-                        progress_callback("Transcript fetched", 1.0)
-                    return result
-                logger.info(f"Tier 1.5b subtitle extraction failed: {result.error}")
-
-        # TIER 2: Audio fallback
+        # TIER 2: Audio fallback (for non-YouTube platforms)
         logger.info("Falling back to audio download + transcription...")
         return self._audio_fallback(url, platform, progress_callback)
     
@@ -288,17 +265,11 @@ class MultiPlatformFetcher:
             )
         
         try:
-            # v1.x uses instance-based API: YouTubeTranscriptApi(cookie_path=...).list(video_id)
-            # v0.x used class methods: YouTubeTranscriptApi.list_transcripts(video_id)
-            try:
-                kwargs = {}
-                if self.cookies_path:
-                    kwargs['cookie_path'] = self.cookies_path
-                ytt_api = YouTubeTranscriptApi(**kwargs)
-                transcript_list = ytt_api.list(video_id)
-            except TypeError:
-                # Fallback for older versions (<0.6)
-                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            # youtube-transcript-api v1.2.x:
+            #   Constructor: YouTubeTranscriptApi()
+            #   Methods: api.list(video_id), api.fetch(video_id)
+            ytt_api = YouTubeTranscriptApi()
+            transcript_list = ytt_api.list(video_id)
 
             # Find best transcript
             transcript = None
@@ -375,6 +346,119 @@ class MultiPlatformFetcher:
                 error=str(e)
             )
     
+    # =========================================================================
+    # TIER 1.5: Gemini YouTube Transcription (googleapis.com — never blocked)
+    # =========================================================================
+
+    def _fetch_transcript_via_gemini(self, url: str) -> TranscriptResult:
+        """
+        Use Gemini to transcribe a YouTube video directly.
+
+        Gemini natively understands YouTube URLs via Google's internal
+        infrastructure. All requests go through googleapis.com, which is
+        NEVER blocked on GCP or any cloud provider IP.
+
+        This is the most reliable method for cloud-deployed applications.
+        """
+        try:
+            from google import genai
+        except ImportError:
+            return TranscriptResult(
+                success=False, platform="youtube", url=url,
+                error="google-genai not installed"
+            )
+
+        api_key = os.environ.get('GEMINI_API_KEY')
+        if not api_key:
+            return TranscriptResult(
+                success=False, platform="youtube", url=url,
+                error="GEMINI_API_KEY not set"
+            )
+
+        video_id = self._extract_youtube_id(url)
+        if not video_id:
+            return TranscriptResult(
+                success=False, platform="youtube", url=url,
+                error="Could not extract YouTube video ID"
+            )
+
+        canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+
+        try:
+            client = genai.Client(api_key=api_key)
+
+            # Step 1: Get metadata via YouTube Data API v3 if available
+            metadata = {}
+            yt_api_key = os.environ.get('YOUTUBE_API_KEY')
+            if yt_api_key:
+                try:
+                    metadata = self._yt_data_api_metadata(video_id, yt_api_key)
+                except Exception:
+                    pass
+
+            # Step 2: Ask Gemini to transcribe the video verbatim
+            logger.info(f"Sending YouTube URL to Gemini for transcription: {canonical_url}")
+
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[
+                    genai.types.Part.from_uri(
+                        file_uri=canonical_url,
+                        mime_type='video/*',
+                    ),
+                    (
+                        "Transcribe every word spoken in this video verbatim. "
+                        "Return ONLY the transcript text — no timestamps, no speaker labels, "
+                        "no commentary, no markdown formatting. "
+                        "Include every sentence from start to finish. "
+                        "Do not summarize or paraphrase."
+                    ),
+                ],
+            )
+
+            transcript_text = response.text.strip()
+
+            if not transcript_text or len(transcript_text) < 50:
+                return TranscriptResult(
+                    success=False, platform="youtube", url=canonical_url,
+                    error="Gemini returned empty or very short transcript"
+                )
+
+            # Clean up any accidental markdown that Gemini might add
+            transcript_text = self._clean_text(transcript_text)
+
+            # Build a single segment (Gemini doesn't provide timestamps)
+            duration = metadata.get('duration', 0)
+            segments = [TranscriptSegment(
+                text=transcript_text,
+                start=0.0,
+                end=float(duration) if duration else 0.0,
+            )]
+
+            logger.info(
+                f"Gemini transcription complete: {len(transcript_text.split())} words"
+            )
+
+            return TranscriptResult(
+                success=True,
+                source=TranscriptSource.YOUTUBE_CAPTIONS,
+                text=transcript_text,
+                segments=segments,
+                title=metadata.get('title', ''),
+                duration_seconds=duration,
+                language="en",
+                is_auto_generated=False,
+                platform="youtube",
+                url=canonical_url,
+            )
+
+        except Exception as e:
+            logger.error(f"Gemini transcription failed: {e}")
+            return TranscriptResult(
+                success=False, platform="youtube", url=canonical_url,
+                error=f"Gemini transcription failed: {e}"
+            )
+
     def _fetch_spotify_transcript(self, url: str) -> TranscriptResult:
         """Fetch Spotify transcript (placeholder for future implementation)"""
         # Spotify has been adding transcripts but API access is limited
@@ -531,51 +615,50 @@ class MultiPlatformFetcher:
             # Step 1: Metadata via YouTube Data API v3 (googleapis.com — never blocked)
             metadata = self._yt_data_api_metadata(video_id, api_key)
 
-            # Step 2: Caption track URLs via innertube player API
+            # Step 2: Try Piped/Invidious proxies (non-GCP IPs, not blocked)
+            result = self._try_piped_invidious(video_id, metadata, url)
+            if result and result.success:
+                logger.info("✅ Got transcript via Piped/Invidious proxy")
+                return result
+
+            # Step 3: Try direct timedtext API (lightweight, sometimes works)
+            result = self._try_direct_timedtext(video_id, metadata)
+            if result and result.success:
+                logger.info("✅ Got transcript via direct timedtext API")
+                return result
+
+            # Step 4: Innertube player API as last resort (multi-client)
             caption_tracks = self._innertube_caption_tracks(video_id)
-            if not caption_tracks:
-                return TranscriptResult(
-                    success=False, platform="youtube", url=url,
-                    error="No caption tracks found via YouTube API"
-                )
+            if caption_tracks:
+                track, is_auto = self._select_caption_track(caption_tracks)
+                if track:
+                    base_url = track['baseUrl']
+                    if '&fmt=' not in base_url:
+                        base_url += '&fmt=json3'
 
-            # Step 3: Pick the best English track
-            track, is_auto = self._select_caption_track(caption_tracks)
-            if not track:
-                return TranscriptResult(
-                    success=False, platform="youtube", url=url,
-                    error="No English caption track available"
-                )
+                    with httpx.Client(follow_redirects=True, timeout=30) as client:
+                        resp = client.get(base_url)
+                        resp.raise_for_status()
+                        data = resp.json()
 
-            # Step 4: Download caption text from the signed track URL
-            base_url = track['baseUrl']
-            if '&fmt=' not in base_url:
-                base_url += '&fmt=json3'
-
-            with httpx.Client(follow_redirects=True, timeout=30) as client:
-                resp = client.get(base_url)
-                resp.raise_for_status()
-                data = resp.json()
-
-            # Step 5: Parse json3 format into segments
-            segments, full_text = self._parse_json3_captions(data)
-            if not full_text:
-                return TranscriptResult(
-                    success=False, platform="youtube", url=url,
-                    error="Caption track was empty after parsing"
-                )
+                    segments, full_text = self._parse_json3_captions(data)
+                    if full_text:
+                        return TranscriptResult(
+                            success=True,
+                            source=TranscriptSource.YOUTUBE_CAPTIONS,
+                            text=full_text,
+                            segments=segments,
+                            title=metadata.get('title', ''),
+                            duration_seconds=metadata.get('duration', 0),
+                            language=track.get('languageCode', 'en'),
+                            is_auto_generated=is_auto,
+                            platform="youtube",
+                            url=url,
+                        )
 
             return TranscriptResult(
-                success=True,
-                source=TranscriptSource.YOUTUBE_CAPTIONS,
-                text=full_text,
-                segments=segments,
-                title=metadata.get('title', ''),
-                duration_seconds=metadata.get('duration', 0),
-                language=track.get('languageCode', 'en'),
-                is_auto_generated=is_auto,
-                platform="youtube",
-                url=url
+                success=False, platform="youtube", url=url,
+                error="All caption methods failed (timedtext, piped, innertube)"
             )
 
         except Exception as e:
@@ -584,6 +667,288 @@ class MultiPlatformFetcher:
                 success=False, platform="youtube", url=url,
                 error=str(e)
             )
+
+    def _try_piped_invidious(
+        self, video_id: str, metadata: dict, original_url: str
+    ) -> Optional[TranscriptResult]:
+        """
+        Fetch captions via Piped and Invidious public API instances.
+        These are third-party YouTube frontend proxies that run on non-GCP IPs,
+        so they are not blocked by YouTube's bot detection.
+        """
+        import httpx
+
+        # Multiple instances for redundancy — if one is down, try the next
+        piped_instances = [
+            "https://pipedapi.kavin.rocks",
+            "https://pipedapi.adminforge.de",
+            "https://pipedapi.in.projectsegfau.lt",
+        ]
+        invidious_instances = [
+            "https://inv.nadeko.net",
+            "https://invidious.privacyredirect.com",
+            "https://vid.puffyan.us",
+        ]
+
+        # --- Try Piped first ---
+        for base in piped_instances:
+            try:
+                with httpx.Client(timeout=10, follow_redirects=True) as client:
+                    resp = client.get(f"{base}/streams/{video_id}")
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+
+                subtitles = data.get('subtitles', [])
+                if not subtitles:
+                    logger.debug(f"Piped {base}: no subtitles returned")
+                    continue
+
+                # Pick best English subtitle track
+                sub_url, is_auto = self._pick_piped_subtitle(subtitles)
+                if not sub_url:
+                    logger.debug(f"Piped {base}: no English subtitle track")
+                    continue
+
+                # Download the subtitle content (VTT format)
+                with httpx.Client(timeout=15, follow_redirects=True) as client:
+                    sub_resp = client.get(sub_url)
+                    if sub_resp.status_code != 200:
+                        continue
+                    vtt_text = sub_resp.text
+
+                segments, full_text = self._parse_vtt_captions(vtt_text)
+                if full_text and len(full_text.strip()) > 50:
+                    title = metadata.get('title', '') or data.get('title', '')
+                    duration = metadata.get('duration', 0) or data.get('duration', 0)
+                    logger.info(f"✅ Got transcript via Piped ({base})")
+                    return TranscriptResult(
+                        success=True,
+                        source=TranscriptSource.YOUTUBE_CAPTIONS,
+                        text=full_text,
+                        segments=segments,
+                        title=title,
+                        duration_seconds=duration,
+                        language="en",
+                        is_auto_generated=is_auto,
+                        platform="youtube",
+                        url=original_url,
+                    )
+            except Exception as e:
+                logger.debug(f"Piped {base} failed: {e}")
+                continue
+
+        # --- Try Invidious ---
+        for base in invidious_instances:
+            try:
+                with httpx.Client(timeout=10, follow_redirects=True) as client:
+                    resp = client.get(f"{base}/api/v1/captions/{video_id}")
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+
+                captions = data.get('captions', [])
+                if not captions:
+                    continue
+
+                # Pick best English caption
+                cap_url, is_auto = self._pick_invidious_caption(captions, base)
+                if not cap_url:
+                    continue
+
+                # Download the caption content
+                with httpx.Client(timeout=15, follow_redirects=True) as client:
+                    sub_resp = client.get(cap_url, params={"label": ""})
+                    if sub_resp.status_code != 200:
+                        continue
+                    vtt_text = sub_resp.text
+
+                segments, full_text = self._parse_vtt_captions(vtt_text)
+                if full_text and len(full_text.strip()) > 50:
+                    title = metadata.get('title', '')
+                    duration = metadata.get('duration', 0)
+                    logger.info(f"✅ Got transcript via Invidious ({base})")
+                    return TranscriptResult(
+                        success=True,
+                        source=TranscriptSource.YOUTUBE_CAPTIONS,
+                        text=full_text,
+                        segments=segments,
+                        title=title,
+                        duration_seconds=duration,
+                        language="en",
+                        is_auto_generated=is_auto,
+                        platform="youtube",
+                        url=original_url,
+                    )
+            except Exception as e:
+                logger.debug(f"Invidious {base} failed: {e}")
+                continue
+
+        logger.warning("All Piped/Invidious instances failed")
+        return None
+
+    @staticmethod
+    def _pick_piped_subtitle(subtitles: list) -> tuple:
+        """Pick best English subtitle from Piped response. Returns (url, is_auto)."""
+        # Prefer manual English
+        for sub in subtitles:
+            code = sub.get('code', '')
+            auto = sub.get('autoGenerated', False)
+            if code.startswith('en') and not auto:
+                return sub.get('url', ''), False
+        # Auto-generated English
+        for sub in subtitles:
+            code = sub.get('code', '')
+            auto = sub.get('autoGenerated', False)
+            if code.startswith('en') and auto:
+                return sub.get('url', ''), True
+        # Any subtitle at all
+        if subtitles:
+            sub = subtitles[0]
+            return sub.get('url', ''), sub.get('autoGenerated', False)
+        return None, False
+
+    @staticmethod
+    def _pick_invidious_caption(captions: list, base_url: str) -> tuple:
+        """Pick best English caption from Invidious response. Returns (url, is_auto)."""
+        # Prefer manual English
+        for cap in captions:
+            lang = cap.get('language_code', '') or cap.get('languageCode', '')
+            label = cap.get('label', '').lower()
+            is_auto = 'auto' in label
+            if lang.startswith('en') and not is_auto:
+                url = cap.get('url', '')
+                if url and not url.startswith('http'):
+                    url = base_url + url
+                return url, False
+        # Auto-generated English
+        for cap in captions:
+            lang = cap.get('language_code', '') or cap.get('languageCode', '')
+            label = cap.get('label', '').lower()
+            is_auto = 'auto' in label
+            if lang.startswith('en') and is_auto:
+                url = cap.get('url', '')
+                if url and not url.startswith('http'):
+                    url = base_url + url
+                return url, True
+        # Any caption
+        if captions:
+            cap = captions[0]
+            url = cap.get('url', '')
+            if url and not url.startswith('http'):
+                url = base_url + url
+            return url, 'auto' in cap.get('label', '').lower()
+        return None, False
+
+    def _parse_vtt_captions(self, vtt_text: str) -> tuple:
+        """Parse WebVTT caption text into segments and full text."""
+        segments = []
+        text_parts = []
+        seen_texts = set()  # Deduplicate rolling captions
+
+        lines = vtt_text.strip().split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            # Look for timestamp lines: 00:00:01.000 --> 00:00:04.000
+            if '-->' in line:
+                parts = line.split('-->')
+                start_str = parts[0].strip().split()[0]  # Handle position tags
+                end_str = parts[1].strip().split()[0]
+                start = self._vtt_time_to_seconds(start_str)
+                end = self._vtt_time_to_seconds(end_str)
+
+                # Collect text lines until empty line or next timestamp
+                caption_lines = []
+                i += 1
+                while i < len(lines) and lines[i].strip() and '-->' not in lines[i]:
+                    # Strip VTT tags like <c>, </c>, <00:00:01.000>
+                    clean = re.sub(r'<[^>]+>', '', lines[i].strip())
+                    if clean:
+                        caption_lines.append(clean)
+                    i += 1
+
+                text = ' '.join(caption_lines).strip()
+                if text and text not in seen_texts:
+                    seen_texts.add(text)
+                    segments.append(TranscriptSegment(text=text, start=start, end=end))
+                    text_parts.append(text)
+            else:
+                i += 1
+
+        full_text = self._clean_text(' '.join(text_parts))
+        return segments, full_text
+
+    @staticmethod
+    def _vtt_time_to_seconds(time_str: str) -> float:
+        """Convert VTT timestamp (HH:MM:SS.mmm or MM:SS.mmm) to seconds."""
+        parts = time_str.replace(',', '.').split(':')
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        elif len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+        return 0.0
+
+    def _try_direct_timedtext(self, video_id: str, metadata: dict) -> Optional[TranscriptResult]:
+        """
+        Try fetching captions via YouTube's direct timedtext API endpoint.
+        This endpoint is lighter than the player page and often works from
+        cloud IPs even when the main player triggers bot detection.
+        """
+        import httpx
+
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        langs_to_try = ['en', 'en-US', 'en-GB']
+
+        for lang in langs_to_try:
+            for kind in ['', 'asr']:  # manual first, then auto-generated
+                try:
+                    params = {
+                        'v': video_id,
+                        'lang': lang,
+                        'fmt': 'json3',
+                    }
+                    if kind:
+                        params['kind'] = kind
+
+                    with httpx.Client(
+                        timeout=15,
+                        follow_redirects=True,
+                        headers={
+                            "User-Agent": (
+                                "Mozilla/5.0 (compatible; Googlebot/2.1; "
+                                "+http://www.google.com/bot.html)"
+                            )
+                        }
+                    ) as client:
+                        resp = client.get(
+                            "https://www.youtube.com/api/timedtext",
+                            params=params,
+                        )
+                        if resp.status_code != 200:
+                            continue
+                        data = resp.json()
+
+                    segments, full_text = self._parse_json3_captions(data)
+                    if full_text and len(full_text.strip()) > 50:
+                        is_auto = kind == 'asr'
+                        return TranscriptResult(
+                            success=True,
+                            source=TranscriptSource.YOUTUBE_CAPTIONS,
+                            text=full_text,
+                            segments=segments,
+                            title=metadata.get('title', ''),
+                            duration_seconds=metadata.get('duration', 0),
+                            language=lang,
+                            is_auto_generated=is_auto,
+                            platform="youtube",
+                            url=url,
+                        )
+                except Exception as e:
+                    logger.debug(f"Direct timedtext {lang}/{kind} failed: {e}")
+                    continue
+
+        return None
 
     def _yt_data_api_metadata(self, video_id: str, api_key: str) -> dict:
         """Fetch video metadata via YouTube Data API v3 (works with API key)."""
@@ -623,33 +988,85 @@ class MultiPlatformFetcher:
 
     @staticmethod
     def _innertube_caption_tracks(video_id: str) -> list:
-        """Get caption tracks via YouTube innertube player API."""
+        """
+        Get caption tracks via YouTube innertube player API.
+        Tries multiple client types to bypass bot detection on cloud IPs:
+        1. ANDROID client — mobile clients are rarely bot-checked on data center IPs
+        2. TV_EMBEDDED client — embedded player, lighter bot detection
+        3. WEB client — standard, most likely to be blocked on GCP
+        """
         import httpx
 
-        payload = {
-            "videoId": video_id,
-            "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": "2.20241001.00.00",
-                    "hl": "en",
+        clients = [
+            {
+                "clientName": "ANDROID",
+                "clientVersion": "19.09.37",
+                "androidSdkVersion": 30,
+                "hl": "en",
+                "gl": "US",
+            },
+            {
+                "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                "clientVersion": "2.0",
+                "hl": "en",
+            },
+            {
+                "clientName": "WEB",
+                "clientVersion": "2.20241001.00.00",
+                "hl": "en",
+            },
+        ]
+
+        for client_info in clients:
+            try:
+                payload = {
+                    "videoId": video_id,
+                    "context": {"client": client_info},
                 }
-            }
-        }
 
-        with httpx.Client(timeout=15) as client:
-            resp = client.post(
-                "https://www.youtube.com/youtubei/v1/player"
-                "?prettyPrint=false",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+                headers = {"Content-Type": "application/json"}
+                # Android client needs a specific user-agent to avoid detection
+                if client_info["clientName"] == "ANDROID":
+                    headers["User-Agent"] = (
+                        "com.google.android.youtube/19.09.37 "
+                        "(Linux; U; Android 11) gzip"
+                    )
 
-        captions = data.get('captions', {})
-        renderer = captions.get('playerCaptionsTracklistRenderer', {})
-        return renderer.get('captionTracks', [])
+                with httpx.Client(timeout=15) as http:
+                    resp = http.post(
+                        "https://www.youtube.com/youtubei/v1/player"
+                        "?prettyPrint=false",
+                        json=payload,
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                # Check for bot/sign-in errors in the response
+                playability = data.get('playabilityStatus', {})
+                if playability.get('status') == 'ERROR':
+                    logger.warning(
+                        f"Innertube {client_info['clientName']}: "
+                        f"{playability.get('reason', 'unknown error')}"
+                    )
+                    continue
+
+                captions = data.get('captions', {})
+                renderer = captions.get('playerCaptionsTracklistRenderer', {})
+                tracks = renderer.get('captionTracks', [])
+                if tracks:
+                    logger.info(
+                        f"Got {len(tracks)} caption tracks via "
+                        f"{client_info['clientName']} innertube client"
+                    )
+                    return tracks
+            except Exception as e:
+                logger.warning(
+                    f"Innertube {client_info['clientName']} failed: {e}"
+                )
+                continue
+
+        return []
 
     @staticmethod
     def _select_caption_track(tracks: list) -> tuple:

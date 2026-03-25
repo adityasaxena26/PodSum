@@ -34,10 +34,6 @@ services:
       # Keeps large files off the container's root overlay filesystem.
       - podsum_tmp:/tmp/podsum
 
-      # YouTube cookies file for authentication on cloud/data-center IPs.
-      # Export from your browser in Netscape format and place at ./cookies.txt
-      - ./cookies.txt:/app/cookies.txt:ro
-
     restart: unless-stopped
 
     # Resource caps — prevents a single runaway job from taking down the host.

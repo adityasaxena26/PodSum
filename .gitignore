@@ -4,15 +4,12 @@ __pycache__/
 *.pyc
 .DS_Store
 
-#Environment variables
-.env
+# Environment variables
 .env.local
 .env.*.local
 
 # Dependencies
 node_modules/
-venv/
-__pycache__/
 
 # IDE files
 .vscode/
@@ -20,10 +17,7 @@ __pycache__/
 *.swp
 
 # OS files
-.DS_Store
 Thumbs.db
 
-node_modules/
-
-.env
-.env/
+# Cookies
+.cookies.txt

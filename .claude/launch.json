@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Podsum Web UI (Gradio)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "src.app"],
+      "port": 7860
+    },
+    {
+      "name": "Docker Compose (Full Stack)",
+      "runtimeExecutable": "docker-compose",
+      "runtimeArgs": ["up", "--build"],
+      "port": 7860
+    }
+  ]
+}

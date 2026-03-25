@@ -5,6 +5,7 @@
 # Secrets — never bake into image
 .env
 .env.*
+cookies.txt
 
 # Python artifacts
 __pycache__/
