@@ -134,6 +134,7 @@ class MultiPlatformFetcher:
         self.whisper_device = whisper_device
         self.prefer_transcripts = prefer_transcripts
         self.temp_dir = temp_dir or tempfile.gettempdir()
+        os.makedirs(self.temp_dir, exist_ok=True)
         
         # Lazy-loaded components
         self._whisper = None
@@ -174,9 +175,22 @@ class MultiPlatformFetcher:
                 if progress_callback:
                     progress_callback("Transcript fetched", 1.0)
                 return result
-            
-            logger.info(f"No platform transcript available: {result.error}")
-        
+
+            tier1_error = result.error
+            logger.info(f"Tier 1 transcript failed: {tier1_error}")
+
+            # TIER 1.5: yt-dlp subtitle extraction (no audio download)
+            if platform == Platform.YOUTUBE:
+                if progress_callback:
+                    progress_callback("Trying subtitle extraction", 0.15)
+                result = self._fetch_youtube_subtitles_ytdlp(url)
+                if result.success:
+                    logger.info("✅ Got transcript via yt-dlp subtitles")
+                    if progress_callback:
+                        progress_callback("Transcript fetched", 1.0)
+                    return result
+                logger.info(f"Tier 1.5 subtitle extraction failed: {result.error}")
+
         # TIER 2: Audio fallback
         logger.info("Falling back to audio download + transcription...")
         return self._audio_fallback(url, platform, progress_callback)
@@ -338,7 +352,111 @@ class MultiPlatformFetcher:
             url=url,
             error="Spotify transcript API not yet available"
         )
-    
+
+    def _fetch_youtube_subtitles_ytdlp(self, url: str) -> TranscriptResult:
+        """
+        Tier 1.5: Download YouTube subtitles via yt-dlp without downloading audio.
+        Used as fallback when youtube-transcript-api is blocked (e.g. on GCP IPs).
+        """
+        try:
+            import yt_dlp
+        except ImportError:
+            return TranscriptResult(success=False, error="yt-dlp not installed")
+
+        import glob as glob_module
+
+        subtitle_base = os.path.join(self.temp_dir, f"podsum_subs_{os.getpid()}")
+
+        ydl_opts = {
+            'skip_download': True,
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': ['en', 'en-US', 'en-GB'],
+            'subtitlesformat': 'vtt',
+            'outtmpl': subtitle_base,
+            'quiet': False,
+            'no_warnings': False,
+        }
+
+        ffmpeg_dir = self._get_ffmpeg_location()
+        if ffmpeg_dir:
+            ydl_opts['ffmpeg_location'] = ffmpeg_dir
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+
+            # Find the downloaded .vtt file
+            vtt_files = glob_module.glob(f"{subtitle_base}*.vtt")
+            if not vtt_files:
+                return TranscriptResult(
+                    success=False, platform="youtube", url=url,
+                    error="No subtitle file downloaded by yt-dlp"
+                )
+
+            vtt_path = vtt_files[0]
+            with open(vtt_path, 'r', encoding='utf-8') as f:
+                raw_vtt = f.read()
+
+            # Parse VTT: strip header, timestamps, tags; keep text lines
+            lines = raw_vtt.splitlines()
+            text_parts = []
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith('WEBVTT') or line.startswith('NOTE'):
+                    continue
+                if re.match(r'^\d{2}:\d{2}', line):   # timestamp line
+                    continue
+                if re.match(r'^\d+$', line):           # cue number
+                    continue
+                # Strip inline tags like <00:00:01.000>, <c>, </c>
+                line = re.sub(r'<[^>]+>', '', line)
+                if line:
+                    text_parts.append(line)
+
+            # Deduplicate consecutive duplicate lines (common in VTT rolling captions)
+            deduped = []
+            for line in text_parts:
+                if not deduped or line != deduped[-1]:
+                    deduped.append(line)
+
+            full_text = self._clean_text(' '.join(deduped))
+
+            # Cleanup
+            for f in vtt_files:
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+            if not full_text:
+                return TranscriptResult(
+                    success=False, platform="youtube", url=url,
+                    error="Subtitle file was empty after parsing"
+                )
+
+            title = info.get('title', '') if isinstance(info, dict) else ''
+            duration = info.get('duration', 0) if isinstance(info, dict) else 0
+
+            return TranscriptResult(
+                success=True,
+                source=TranscriptSource.YOUTUBE_CAPTIONS,
+                text=full_text,
+                title=title,
+                duration_seconds=duration,
+                language='en',
+                is_auto_generated=True,
+                platform="youtube",
+                url=url
+            )
+
+        except Exception as e:
+            logger.error(f"yt-dlp subtitle extraction failed: {e}")
+            return TranscriptResult(
+                success=False, platform="youtube", url=url,
+                error=str(e)
+            )
+
     def _extract_youtube_id(self, url: str) -> Optional[str]:
         """Extract YouTube video ID"""
         patterns = [
@@ -382,11 +500,12 @@ class MultiPlatformFetcher:
             audio_path, metadata = self._download_audio(url)
             
             if not audio_path:
+                dl_error = metadata.get("error", "unknown error")
                 return TranscriptResult(
                     success=False,
                     platform=platform.value,
                     url=url,
-                    error="Failed to download audio"
+                    error=f"Failed to download audio: {dl_error}"
                 )
             
             logger.info(f"Downloaded: {metadata.get('title', 'Unknown')}")
@@ -454,8 +573,8 @@ class MultiPlatformFetcher:
             # Prefer m4a, then webm, then any audio — no ffmpeg conversion needed
             'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
             'outtmpl': output_template,
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False,
+            'no_warnings': False,
         }
 
         # If ffmpeg happens to be available, let yt-dlp use it for better format selection
@@ -490,7 +609,7 @@ class MultiPlatformFetcher:
 
         except Exception as e:
             logger.error(f"Download failed: {e}")
-            return None, {}
+            return None, {"error": str(e)}
     
     def _transcribe_audio(
         self,
