@@ -114,16 +114,40 @@ class PodcastSummarizerV2:
         Returns:
             dict with 'success', 'transcript', 'summary', 'error'
         """
+        format_map = {
+            "detailed": SummaryFormat.DETAILED,
+            "quick": SummaryFormat.QUICK,
+            "bullets": SummaryFormat.BULLETS,
+            "chapters": SummaryFormat.CHAPTERS,
+        }
+        summary_format = format_map.get(format, SummaryFormat.DETAILED)
+
+        # Fast path: Combined Gemini transcribe + summarize in ONE API call.
+        # When the URL is YouTube and Gemini is available, this avoids two
+        # separate expensive Gemini calls (transcribe → summarize).
+        if (
+            not force_audio
+            and self._is_youtube_url(url)
+            and os.environ.get('GEMINI_API_KEY')
+        ):
+            if progress_callback:
+                progress_callback("Transcribing & summarizing via Gemini...", 0.1)
+            result = self._combined_gemini(url, summary_format, title, progress_callback)
+            if result and result['success']:
+                return result
+            logger.info("Combined Gemini path failed, falling back to 2-step pipeline")
+
+        # Standard 2-step path: fetch transcript, then summarize separately.
         # Step 1: Fetch transcript
         if progress_callback:
             progress_callback("Fetching transcript...", 0.1)
-        
+
         transcript_result = self.fetcher.fetch(
             url,
             force_audio=force_audio,
             progress_callback=progress_callback
         )
-        
+
         if not transcript_result.success:
             return {
                 'success': False,
@@ -131,30 +155,23 @@ class PodcastSummarizerV2:
                 'transcript': transcript_result,
                 'summary': None
             }
-        
+
         logger.info(
             f"Got transcript via {transcript_result.source.value}: "
             f"{transcript_result.word_count} words"
         )
-        
+
         # Step 2: Summarize
         if progress_callback:
             progress_callback("Generating summary...", 0.6)
-        
-        format_map = {
-            "detailed": SummaryFormat.DETAILED,
-            "quick": SummaryFormat.QUICK,
-            "bullets": SummaryFormat.BULLETS,
-            "chapters": SummaryFormat.CHAPTERS,
-        }
-        
+
         summary_result = self.summarizer.summarize(
             transcript=transcript_result.text,
             title=title or transcript_result.title or "Untitled",
-            format=format_map.get(format, SummaryFormat.DETAILED),
+            format=summary_format,
             duration_minutes=transcript_result.duration_minutes
         )
-        
+
         if not summary_result.success:
             return {
                 'success': False,
@@ -162,16 +179,236 @@ class PodcastSummarizerV2:
                 'transcript': transcript_result,
                 'summary': summary_result
             }
-        
+
         if progress_callback:
             progress_callback("Complete!", 1.0)
-        
+
         return {
             'success': True,
             'transcript': transcript_result,
             'summary': summary_result
         }
     
+    # =================================================================
+    # Combined Gemini fast path (single API call)
+    # =================================================================
+
+    @staticmethod
+    def _is_youtube_url(url: str) -> bool:
+        """Check if the URL is a YouTube video."""
+        from urllib.parse import urlparse
+        domain = urlparse(url.lower()).netloc
+        return any(d in domain for d in ['youtube.com', 'youtu.be'])
+
+    def _combined_gemini(
+        self,
+        url: str,
+        summary_format: SummaryFormat,
+        title: Optional[str],
+        progress_callback=None,
+    ) -> Optional[dict]:
+        """
+        Transcribe AND summarize a YouTube video in a single Gemini API call.
+
+        Instead of:  video → Gemini(transcribe) → text → Gemini(summarize) → JSON
+        Does:        video → Gemini(transcribe+summarize) → JSON + transcript
+
+        Returns the standard result dict, or None if the combined path fails
+        (so the caller falls back to the 2-step pipeline).
+        """
+        import json, re
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError:
+            return None
+
+        api_key = os.environ.get('GEMINI_API_KEY')
+        if not api_key:
+            return None
+
+        # Extract video ID and get metadata via YouTube Data API v3
+        video_id = self.fetcher._extract_youtube_id(url)
+        if not video_id:
+            return None
+
+        canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+
+        metadata = {}
+        yt_api_key = os.environ.get('YOUTUBE_API_KEY')
+        if yt_api_key:
+            try:
+                metadata = self.fetcher._yt_data_api_metadata(video_id, yt_api_key)
+            except Exception:
+                pass
+
+        video_title = title or metadata.get('title', 'Untitled')
+        duration = metadata.get('duration', 0)
+        duration_min = duration / 60 if duration else 0
+
+        schema = EnhancedSummarizer.get_format_schema(summary_format)
+        client = genai.Client(api_key=api_key)
+        video_part = genai.types.Part.from_uri(
+            file_uri=canonical_url,
+            mime_type='video/*',
+        )
+
+        def _get_summary():
+            """Fast: ask Gemini for JSON summary only (~7-15s with flash-lite)."""
+            resp = client.models.generate_content(
+                model='gemini-2.5-flash-lite',
+                contents=[
+                    video_part,
+                    f"""Analyze this video and return a structured JSON summary.
+
+VIDEO TITLE: {video_title}
+{"DURATION: " + f"{duration_min:.0f} minutes" if duration_min else ""}
+
+{schema}
+
+RULES:
+- Return ONLY valid JSON — no markdown fences, no commentary
+- Start with {{ and end with }}
+- Be specific and detailed, referencing actual content from the video
+- For quotes, use exact words from the video""",
+                ],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=8192,
+                    temperature=0.3,
+                ),
+            )
+            return resp.text.strip()
+
+        def _get_transcript():
+            """Fast: ask Gemini for verbatim transcript only (~7-15s with flash-lite)."""
+            resp = client.models.generate_content(
+                model='gemini-2.5-flash-lite',
+                contents=[
+                    video_part,
+                    (
+                        "Transcribe every word spoken in this video verbatim. "
+                        "Return ONLY the transcript text — no timestamps, "
+                        "no speaker labels, no commentary, no markdown."
+                    ),
+                ],
+                config=types.GenerateContentConfig(
+                    max_output_tokens=16384,
+                    temperature=0.1,
+                ),
+            )
+            return resp.text.strip()
+
+        try:
+            if progress_callback:
+                progress_callback("Gemini is watching the video...", 0.15)
+
+            logger.info(
+                f"Parallel Gemini calls: {canonical_url} "
+                f"(format={summary_format.value})"
+            )
+
+            # Fire both calls in parallel — each takes ~7-15s, total ~7-15s
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                summary_future = pool.submit(_get_summary)
+                transcript_future = pool.submit(_get_transcript)
+
+                if progress_callback:
+                    progress_callback("Transcribing & summarizing...", 0.4)
+
+                summary_raw = summary_future.result(timeout=120)
+                transcript_text = transcript_future.result(timeout=120)
+
+            if progress_callback:
+                progress_callback("Parsing response...", 0.85)
+
+            # Parse summary JSON
+            raw = summary_raw
+            if raw.startswith('```'):
+                raw = re.sub(r'^```(?:json)?\s*', '', raw)
+                raw = re.sub(r'\s*```$', '', raw)
+            summary_data = json.loads(raw)
+
+            if not transcript_text or len(transcript_text) < 50:
+                logger.warning("Combined Gemini: transcript too short")
+                return None
+
+            # Build TranscriptResult
+            transcript_result = TranscriptResult(
+                success=True,
+                source=TranscriptSource.YOUTUBE_CAPTIONS,
+                text=transcript_text,
+                segments=[],
+                title=video_title,
+                duration_seconds=duration,
+                language="en",
+                is_auto_generated=False,
+                platform="youtube",
+                url=canonical_url,
+            )
+
+            # Build Summary
+            summary_result = Summary(
+                success=True,
+                executive_summary=summary_data.get('executive_summary', ''),
+                key_takeaways=summary_data.get('key_takeaways', []),
+                chapters=[],
+                notable_quotes=[],
+                topics=summary_data.get('topics', []),
+                action_items=summary_data.get('action_items', []),
+                word_count_original=len(transcript_text.split()),
+                word_count_summary=len(
+                    summary_data.get('executive_summary', '').split()
+                ),
+                duration_minutes=duration_min,
+                title=video_title,
+            )
+
+            # Parse chapters if present
+            for ch in summary_data.get('chapters', []):
+                if isinstance(ch, dict):
+                    summary_result.chapters.append(
+                        type('Chapter', (), {
+                            'title': ch.get('title', ''),
+                            'timestamp': ch.get('timestamp', ''),
+                            'summary': ch.get('summary', ''),
+                        })()
+                    )
+
+            # Parse quotes if present
+            for q in summary_data.get('notable_quotes', []):
+                if isinstance(q, dict):
+                    summary_result.notable_quotes.append(
+                        type('Quote', (), {
+                            'text': q.get('text', ''),
+                            'speaker': q.get('speaker', ''),
+                            'context': q.get('context', ''),
+                        })()
+                    )
+
+            if progress_callback:
+                progress_callback("Complete!", 1.0)
+
+            logger.info(
+                f"✅ Parallel Gemini complete: "
+                f"{transcript_result.word_count} words transcript, "
+                f"{len(summary_result.key_takeaways)} takeaways"
+            )
+
+            return {
+                'success': True,
+                'transcript': transcript_result,
+                'summary': summary_result,
+            }
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Combined Gemini JSON parse failed: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Combined Gemini failed: {e}")
+            return None
+
     def summarize_file(
         self,
         file_path: str,

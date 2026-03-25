@@ -353,8 +353,8 @@ class EnhancedSummarizer:
                         return self._summarize_long(
                             transcript, title, format, content_type, duration_minutes
                         )
-                    logger.warning("Rate limited, waiting 30s...")
-                    time.sleep(30)
+                    logger.warning("Rate limited, waiting 10s...")
+                    time.sleep(10)
                 elif "payload" in error_str or "context_length" in error_str or "too large" in error_str:
                     # Payload too large - force chunking even if under MAX_CONTEXT_CHARS
                     logger.warning(f"Payload too large, using chunked processing")
@@ -413,7 +413,53 @@ class EnhancedSummarizer:
             return ContentType.NEWS
         
         return ContentType.GENERAL
-    
+
+    @staticmethod
+    def get_format_schema(format: 'SummaryFormat') -> str:
+        """Return the format-specific JSON schema for summary output.
+
+        Extracted as a public method so it can be reused by the combined
+        Gemini transcribe+summarize path in main.py.
+        """
+        if format == SummaryFormat.QUICK:
+            return '''Return JSON:
+{
+    "executive_summary": "2-3 paragraphs",
+    "key_takeaways": ["5-7 key points"],
+    "topics": ["main topics"]
+}'''
+        elif format == SummaryFormat.BULLETS:
+            return '''Return JSON:
+{
+    "key_takeaways": ["7-10 key points as complete sentences"]
+}'''
+        elif format == SummaryFormat.CHAPTERS:
+            return '''Return JSON:
+{
+    "chapters": [
+        {"title": "Chapter Name", "timestamp": "MM:SS", "summary": "Description"}
+    ],
+    "executive_summary": "Brief overview"
+}'''
+        else:  # DETAILED
+            return '''Return JSON:
+{
+    "executive_summary": "Comprehensive 2-3 paragraph summary",
+    "key_takeaways": [
+        "First key insight",
+        "Second key insight",
+        "Include 5-7 total"
+    ],
+    "chapters": [
+        {"title": "Section Title", "timestamp": "MM:SS", "summary": "What's covered"}
+    ],
+    "notable_quotes": [
+        {"text": "Exact quote", "speaker": "Who said it", "context": "Why notable"}
+    ],
+    "topics": ["topic1", "topic2"],
+    "action_items": ["Recommendations or calls to action mentioned"]
+}'''
+
     def _build_prompt(
         self,
         transcript: str,
@@ -476,45 +522,8 @@ Focus on:
             content_type, content_instructions[ContentType.GENERAL]
         )
         
-        # Format-specific structure
-        if format == SummaryFormat.QUICK:
-            structure = '''Return JSON:
-{
-    "executive_summary": "2-3 paragraphs",
-    "key_takeaways": ["5-7 key points"],
-    "topics": ["main topics"]
-}'''
-        elif format == SummaryFormat.BULLETS:
-            structure = '''Return JSON:
-{
-    "key_takeaways": ["7-10 key points as complete sentences"]
-}'''
-        elif format == SummaryFormat.CHAPTERS:
-            structure = '''Return JSON:
-{
-    "chapters": [
-        {"title": "Chapter Name", "timestamp": "MM:SS", "summary": "Description"}
-    ],
-    "executive_summary": "Brief overview"
-}'''
-        else:  # DETAILED
-            structure = '''Return JSON:
-{
-    "executive_summary": "Comprehensive 2-3 paragraph summary",
-    "key_takeaways": [
-        "First key insight",
-        "Second key insight",
-        "Include 5-7 total"
-    ],
-    "chapters": [
-        {"title": "Section Title", "timestamp": "MM:SS", "summary": "What's covered"}
-    ],
-    "notable_quotes": [
-        {"text": "Exact quote", "speaker": "Who said it", "context": "Why notable"}
-    ],
-    "topics": ["topic1", "topic2"],
-    "action_items": ["Recommendations or calls to action mentioned"]
-}'''
+        structure = self.get_format_schema(format)
+
         
         return f"""You are an expert content summarizer. Analyze this {content_type.value} transcript.
 
@@ -724,17 +733,16 @@ Focus on NEW information not already covered."""
                 except Exception as e:
                     error_str = str(e).lower()
                     if "rate_limit" in error_str and attempt < 2:
-                        logger.warning(f"Chunk {i+1} rate limited, waiting 30s (attempt {attempt+1}/3)...")
-                        time.sleep(30)
+                        logger.warning(f"Chunk {i+1} rate limited, waiting 10s (attempt {attempt+1}/3)...")
+                        time.sleep(10)
                     else:
                         logger.error(f"Chunk {i+1} failed: {e}")
                         break
 
-            # Wait for TPM window to reset (6K TPM limit on Groq free tier).
-            # Each chunk uses ~4K-5.5K tokens, so we need ~60s between calls.
+            # Wait for TPM rolling window (6K TPM limit on Groq free tier).
             if i < len(chunks) - 1:
-                logger.info(f"Waiting 60s for rate limit window to reset...")
-                time.sleep(60)
+                logger.info(f"Waiting 15s for rate limit window...")
+                time.sleep(15)
 
         # Final synthesis
         logger.info("Creating final summary from accumulated insights...")

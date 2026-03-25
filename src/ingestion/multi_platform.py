@@ -400,7 +400,7 @@ class MultiPlatformFetcher:
             logger.info(f"Sending YouTube URL to Gemini for transcription: {canonical_url}")
 
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model='gemini-2.5-flash-lite',
                 contents=[
                     genai.types.Part.from_uri(
                         file_uri=canonical_url,
