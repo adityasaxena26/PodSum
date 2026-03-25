@@ -5,13 +5,15 @@
       "name": "Podsum Web UI (Gradio)",
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "src.app"],
-      "port": 7860
+      "port": 7860,
+      "autoPort": true
     },
     {
       "name": "Docker Compose (Full Stack)",
       "runtimeExecutable": "docker-compose",
       "runtimeArgs": ["up", "--build"],
-      "port": 7860
+      "port": 7860,
+      "autoPort": true
     }
   ]
 }
