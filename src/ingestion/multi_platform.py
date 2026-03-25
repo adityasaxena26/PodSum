@@ -122,7 +122,7 @@ class MultiPlatformFetcher:
     ):
         """
         Initialize fetcher.
-        
+
         Args:
             whisper_model: Whisper model size for audio fallback
                           Options: tiny, base, small, medium, large-v2, large-v3
@@ -135,10 +135,27 @@ class MultiPlatformFetcher:
         self.prefer_transcripts = prefer_transcripts
         self.temp_dir = temp_dir or tempfile.gettempdir()
         os.makedirs(self.temp_dir, exist_ok=True)
-        
+
+        # Cookie file for YouTube authentication (needed on cloud/data-center IPs)
+        self.cookies_path = self._find_cookies_file()
+        if self.cookies_path:
+            logger.info(f"Using cookies file: {self.cookies_path}")
+
         # Lazy-loaded components
         self._whisper = None
         self._yt_dlp = None
+
+    def _find_cookies_file(self) -> Optional[str]:
+        """Locate a Netscape-format cookies.txt file for YouTube authentication."""
+        # 1. Explicit env var
+        env_path = os.environ.get('YOUTUBE_COOKIES_PATH')
+        if env_path and os.path.isfile(env_path):
+            return env_path
+        # 2. Common default locations
+        for candidate in ['/app/cookies.txt', 'cookies.txt']:
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+        return None
     
     def fetch(
         self,
@@ -179,7 +196,19 @@ class MultiPlatformFetcher:
             tier1_error = result.error
             logger.info(f"Tier 1 transcript failed: {tier1_error}")
 
-            # TIER 1.5: yt-dlp subtitle extraction (no audio download)
+            # TIER 1.5a: YouTube Data API v3 + innertube (works from cloud IPs)
+            if platform == Platform.YOUTUBE and os.environ.get('YOUTUBE_API_KEY'):
+                if progress_callback:
+                    progress_callback("Trying YouTube Data API", 0.12)
+                result = self._fetch_youtube_transcript_data_api(url)
+                if result.success:
+                    logger.info("✅ Got transcript via YouTube Data API")
+                    if progress_callback:
+                        progress_callback("Transcript fetched", 1.0)
+                    return result
+                logger.info(f"Tier 1.5a Data API failed: {result.error}")
+
+            # TIER 1.5b: yt-dlp subtitle extraction (no audio download)
             if platform == Platform.YOUTUBE:
                 if progress_callback:
                     progress_callback("Trying subtitle extraction", 0.15)
@@ -189,7 +218,7 @@ class MultiPlatformFetcher:
                     if progress_callback:
                         progress_callback("Transcript fetched", 1.0)
                     return result
-                logger.info(f"Tier 1.5 subtitle extraction failed: {result.error}")
+                logger.info(f"Tier 1.5b subtitle extraction failed: {result.error}")
 
         # TIER 2: Audio fallback
         logger.info("Falling back to audio download + transcription...")
@@ -259,10 +288,13 @@ class MultiPlatformFetcher:
             )
         
         try:
-            # v1.x uses instance-based API: YouTubeTranscriptApi().list(video_id)
+            # v1.x uses instance-based API: YouTubeTranscriptApi(cookie_path=...).list(video_id)
             # v0.x used class methods: YouTubeTranscriptApi.list_transcripts(video_id)
             try:
-                ytt_api = YouTubeTranscriptApi()
+                kwargs = {}
+                if self.cookies_path:
+                    kwargs['cookie_path'] = self.cookies_path
+                ytt_api = YouTubeTranscriptApi(**kwargs)
                 transcript_list = ytt_api.list(video_id)
             except TypeError:
                 # Fallback for older versions (<0.6)
@@ -378,6 +410,9 @@ class MultiPlatformFetcher:
             'no_warnings': False,
         }
 
+        if self.cookies_path:
+            ydl_opts['cookiefile'] = self.cookies_path
+
         ffmpeg_dir = self._get_ffmpeg_location()
         if ffmpeg_dir:
             ydl_opts['ffmpeg_location'] = ffmpeg_dir
@@ -456,6 +491,213 @@ class MultiPlatformFetcher:
                 success=False, platform="youtube", url=url,
                 error=str(e)
             )
+
+    # =========================================================================
+    # TIER 1.5a: YouTube Data API v3 + Innertube
+    # =========================================================================
+
+    def _fetch_youtube_transcript_data_api(self, url: str) -> TranscriptResult:
+        """
+        Fetch YouTube captions using YouTube Data API v3 for metadata and the
+        innertube player API for caption track URLs. This avoids loading the
+        full YouTube video page, which is what triggers bot detection on
+        cloud/data-center IPs.
+
+        Requires YOUTUBE_API_KEY environment variable.
+        """
+        api_key = os.environ.get('YOUTUBE_API_KEY')
+        if not api_key:
+            return TranscriptResult(
+                success=False, platform="youtube", url=url,
+                error="YOUTUBE_API_KEY not set"
+            )
+
+        video_id = self._extract_youtube_id(url)
+        if not video_id:
+            return TranscriptResult(
+                success=False, platform="youtube", url=url,
+                error="Could not extract YouTube video ID"
+            )
+
+        try:
+            import httpx
+        except ImportError:
+            return TranscriptResult(
+                success=False, platform="youtube", url=url,
+                error="httpx not installed"
+            )
+
+        try:
+            # Step 1: Metadata via YouTube Data API v3 (googleapis.com — never blocked)
+            metadata = self._yt_data_api_metadata(video_id, api_key)
+
+            # Step 2: Caption track URLs via innertube player API
+            caption_tracks = self._innertube_caption_tracks(video_id)
+            if not caption_tracks:
+                return TranscriptResult(
+                    success=False, platform="youtube", url=url,
+                    error="No caption tracks found via YouTube API"
+                )
+
+            # Step 3: Pick the best English track
+            track, is_auto = self._select_caption_track(caption_tracks)
+            if not track:
+                return TranscriptResult(
+                    success=False, platform="youtube", url=url,
+                    error="No English caption track available"
+                )
+
+            # Step 4: Download caption text from the signed track URL
+            base_url = track['baseUrl']
+            if '&fmt=' not in base_url:
+                base_url += '&fmt=json3'
+
+            with httpx.Client(follow_redirects=True, timeout=30) as client:
+                resp = client.get(base_url)
+                resp.raise_for_status()
+                data = resp.json()
+
+            # Step 5: Parse json3 format into segments
+            segments, full_text = self._parse_json3_captions(data)
+            if not full_text:
+                return TranscriptResult(
+                    success=False, platform="youtube", url=url,
+                    error="Caption track was empty after parsing"
+                )
+
+            return TranscriptResult(
+                success=True,
+                source=TranscriptSource.YOUTUBE_CAPTIONS,
+                text=full_text,
+                segments=segments,
+                title=metadata.get('title', ''),
+                duration_seconds=metadata.get('duration', 0),
+                language=track.get('languageCode', 'en'),
+                is_auto_generated=is_auto,
+                platform="youtube",
+                url=url
+            )
+
+        except Exception as e:
+            logger.error(f"YouTube Data API transcript fetch failed: {e}")
+            return TranscriptResult(
+                success=False, platform="youtube", url=url,
+                error=str(e)
+            )
+
+    def _yt_data_api_metadata(self, video_id: str, api_key: str) -> dict:
+        """Fetch video metadata via YouTube Data API v3 (works with API key)."""
+        import httpx
+
+        url = (
+            "https://www.googleapis.com/youtube/v3/videos"
+            f"?part=snippet,contentDetails&id={video_id}&key={api_key}"
+        )
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+        if not data.get('items'):
+            return {}
+
+        item = data['items'][0]
+        snippet = item.get('snippet', {})
+        content_details = item.get('contentDetails', {})
+
+        return {
+            'title': snippet.get('title', ''),
+            'duration': self._parse_iso8601_duration(content_details.get('duration', '')),
+            'channel': snippet.get('channelTitle', ''),
+            'description': snippet.get('description', '')[:500],
+        }
+
+    @staticmethod
+    def _parse_iso8601_duration(duration: str) -> int:
+        """Parse ISO 8601 duration like PT1H2M3S to total seconds."""
+        match = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?', duration or '')
+        if not match:
+            return 0
+        h, m, s = (int(g) if g else 0 for g in match.groups())
+        return h * 3600 + m * 60 + s
+
+    @staticmethod
+    def _innertube_caption_tracks(video_id: str) -> list:
+        """Get caption tracks via YouTube innertube player API."""
+        import httpx
+
+        payload = {
+            "videoId": video_id,
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20241001.00.00",
+                    "hl": "en",
+                }
+            }
+        }
+
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(
+                "https://www.youtube.com/youtubei/v1/player"
+                "?prettyPrint=false",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        captions = data.get('captions', {})
+        renderer = captions.get('playerCaptionsTracklistRenderer', {})
+        return renderer.get('captionTracks', [])
+
+    @staticmethod
+    def _select_caption_track(tracks: list) -> tuple:
+        """Pick the best caption track. Returns (track_dict, is_auto_generated)."""
+        # Prefer manually created English captions
+        for track in tracks:
+            lang = track.get('languageCode', '')
+            if lang.startswith('en') and track.get('kind', '') != 'asr':
+                return track, False
+
+        # Auto-generated English
+        for track in tracks:
+            lang = track.get('languageCode', '')
+            if lang.startswith('en') and track.get('kind', '') == 'asr':
+                return track, True
+
+        # Any track at all
+        if tracks:
+            t = tracks[0]
+            return t, t.get('kind', '') == 'asr'
+
+        return None, False
+
+    def _parse_json3_captions(self, data: dict) -> tuple:
+        """Parse YouTube json3 caption format. Returns (segments, full_text)."""
+        events = data.get('events', [])
+        segments = []
+        text_parts = []
+
+        for event in events:
+            segs = event.get('segs')
+            if not segs:
+                continue
+
+            seg_text = ''.join(s.get('utf8', '') for s in segs).strip()
+            if not seg_text or seg_text == '\n':
+                continue
+
+            start_ms = event.get('tStartMs', 0)
+            duration_ms = event.get('dDurationMs', 0)
+            start = start_ms / 1000.0
+            end = (start_ms + duration_ms) / 1000.0
+
+            segments.append(TranscriptSegment(text=seg_text, start=start, end=end))
+            text_parts.append(seg_text)
+
+        full_text = self._clean_text(' '.join(text_parts))
+        return segments, full_text
 
     def _extract_youtube_id(self, url: str) -> Optional[str]:
         """Extract YouTube video ID"""
@@ -576,6 +818,9 @@ class MultiPlatformFetcher:
             'quiet': False,
             'no_warnings': False,
         }
+
+        if self.cookies_path:
+            ydl_opts['cookiefile'] = self.cookies_path
 
         # If ffmpeg happens to be available, let yt-dlp use it for better format selection
         ffmpeg_dir = self._get_ffmpeg_location()

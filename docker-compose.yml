@@ -17,6 +17,10 @@ services:
       # model here will trigger a download on first request.
       WHISPER_MODEL: "small"
 
+      # YouTube Data API key — enables caption fetching from cloud IPs.
+      # Set in .env or inject from GCP Secret Manager in production.
+      YOUTUBE_API_KEY: "${YOUTUBE_API_KEY}"
+
       # Temp audio files land here. The named volume below prevents
       # filling the container's root filesystem on large audio files.
       TMPDIR: /tmp/podsum
@@ -29,6 +33,10 @@ services:
       # Dedicated tmp space for downloaded audio files.
       # Keeps large files off the container's root overlay filesystem.
       - podsum_tmp:/tmp/podsum
+
+      # YouTube cookies file for authentication on cloud/data-center IPs.
+      # Export from your browser in Netscape format and place at ./cookies.txt
+      - ./cookies.txt:/app/cookies.txt:ro
 
     restart: unless-stopped
 

@@ -64,6 +64,17 @@ EXPOSE 7860
 # /tmp is writable by all users; TMPDIR overrides tempfile.gettempdir() calls.
 ENV TMPDIR=/tmp
 
+# YouTube Data API key for fetching captions from cloud/data-center IPs.
+# Get one at: https://console.cloud.google.com/apis/credentials
+# Enable "YouTube Data API v3" in the GCP console.
+# Set via env var at runtime (do NOT bake into the image).
+# ENV YOUTUBE_API_KEY=your-key-here
+
+# Optional: YouTube cookies file as additional fallback.
+# Mount a Netscape-format cookies.txt at /app/cookies.txt (auto-detected)
+# or set YOUTUBE_COOKIES_PATH to a custom location.
+ENV YOUTUBE_COOKIES_PATH=/app/cookies.txt
+
 # Health check: Gradio serves its root at / once ready.
 # start-period gives the model-loading time before probes count as failures.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
