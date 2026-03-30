@@ -17,6 +17,7 @@ Version: 2.0.0
 import os
 import re
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Callable
 from urllib.parse import urlparse, parse_qs
@@ -411,7 +412,7 @@ class MultiPlatformFetcher:
             logger.info(f"Sending YouTube URL to Gemini for transcription: {canonical_url}")
 
             response = client.models.generate_content(
-                model='gemini-2.5-flash-lite',
+                model=os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash-lite'),
                 contents=[
                     genai.types.Part.from_uri(
                         file_uri=canonical_url,
@@ -1237,7 +1238,7 @@ class MultiPlatformFetcher:
         # Use %(ext)s so yt-dlp writes the correct extension automatically
         output_template = os.path.join(
             self.temp_dir,
-            f"podcast_audio_{os.getpid()}.%(ext)s"
+            f"podcast_audio_{os.getpid()}_{threading.get_ident()}.%(ext)s"
         )
 
         ydl_opts = {
@@ -1265,7 +1266,7 @@ class MultiPlatformFetcher:
                     info = info['entries'][0]
 
                 # Find the downloaded file (extension is determined by yt-dlp)
-                pattern = os.path.join(self.temp_dir, f"podcast_audio_{os.getpid()}.*")
+                pattern = os.path.join(self.temp_dir, f"podcast_audio_{os.getpid()}_{threading.get_ident()}.*")
                 files = glob_module.glob(pattern)
                 actual_path = files[0] if files else None
 

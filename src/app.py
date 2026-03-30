@@ -26,13 +26,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 from main import PodcastSummarizerV2
 
 
-# Thread-safe app initialization
+# ── Thread-safe app initialization ──────────────────────────────────
 _app_lock = threading.Lock()
 _app = None
 _app_whisper_model = None
 
+# Read default whisper model from env (matches Dockerfile/docker-compose)
+_DEFAULT_WHISPER = os.environ.get('WHISPER_MODEL', 'small')
 
-def get_app(whisper_model="base"):
+
+def get_app(whisper_model=None):
+    whisper_model = whisper_model or _DEFAULT_WHISPER
     global _app, _app_whisper_model
     with _app_lock:
         if _app is None or _app_whisper_model != whisper_model:
@@ -41,17 +45,38 @@ def get_app(whisper_model="base"):
         return _app
 
 
+# ── Helpers ─────────────────────────────────────────────────────────
+
 def _check_api_keys():
     """Validate API keys are set. Returns error string or None."""
     if not os.environ.get('GEMINI_API_KEY') and not os.environ.get('GROQ_API_KEY'):
         return (
-            "No API key set!\n\n"
-            "Option 1 (recommended): export GEMINI_API_KEY='your-key'\n"
-            "Get free key at: aistudio.google.com/apikey\n\n"
-            "Option 2: export GROQ_API_KEY='your-key'\n"
-            "Get free key at: console.groq.com"
+            "**No API key configured.**\n\n"
+            "Set one of these environment variables before starting the app:\n\n"
+            "- `GEMINI_API_KEY` (recommended, free at [aistudio.google.com/apikey](https://aistudio.google.com/apikey))\n"
+            "- `GROQ_API_KEY` (free at [console.groq.com](https://console.groq.com))"
         )
     return None
+
+
+_ERROR_MAP = {
+    "quota exhausted": "The AI service is temporarily at capacity. Please try again in a few minutes.",
+    "could not extract youtube video id": "This doesn't look like a valid YouTube URL. Please check and try again.",
+    "no transcript available": "This video has no captions available. Try enabling **Force audio transcription**.",
+    "unsupported url scheme": "Only http:// and https:// URLs are supported.",
+    "gemini failed after retries": "The AI service failed to respond. Please try again shortly.",
+    "json parse failed": "The AI returned an unexpected response. Please try again.",
+    "empty transcript": "Could not extract any text from this content.",
+}
+
+
+def _friendly_error(raw_error: str) -> str:
+    """Convert technical errors to user-friendly messages."""
+    lower = raw_error.lower()
+    for pattern, friendly in _ERROR_MAP.items():
+        if pattern in lower:
+            return friendly
+    return raw_error
 
 
 def _format_result(result, app_instance):
@@ -60,13 +85,14 @@ def _format_result(result, app_instance):
     summary = result['summary']
 
     status = (
-        f"**Success!**\n\n"
-        f"- **Source:** {transcript.source.value}\n"
-        f"- **Platform:** {transcript.platform}\n"
-        f"- **Duration:** {transcript.duration_minutes:.1f} minutes\n"
-        f"- **Words:** {transcript.word_count:,}\n"
-        f"- **Content Type:** {summary.content_type.value}\n"
-        f"- **Compression:** {summary.compression_ratio:.1f}x"
+        f"**Done!**\n\n"
+        f"| | |\n|---|---|\n"
+        f"| Source | {transcript.source.value} |\n"
+        f"| Platform | {transcript.platform} |\n"
+        f"| Duration | {transcript.duration_minutes:.1f} min |\n"
+        f"| Words | {transcript.word_count:,} |\n"
+        f"| Content Type | {summary.content_type.value} |\n"
+        f"| Compression | {summary.compression_ratio:.1f}x |"
     )
 
     summary_md = app_instance.format_markdown(transcript, summary)
@@ -87,6 +113,8 @@ def _format_result(result, app_instance):
     return status, summary_md, transcript_text, download_path
 
 
+# ── Processing functions ────────────────────────────────────────────
+
 def process_url(
     url: str,
     format_choice: str,
@@ -97,7 +125,12 @@ def process_url(
 ):
     """Process URL and generate summary."""
     if not url or not url.strip():
-        return "Please enter a URL", "", "", None
+        return "Enter a URL above to get started.", "", "", None
+
+    # Basic URL format check
+    url = url.strip()
+    if not url.startswith(('http://', 'https://')):
+        return "Please enter a valid URL starting with http:// or https://", "", "", None
 
     key_err = _check_api_keys()
     if key_err:
@@ -110,7 +143,7 @@ def process_url(
 
     try:
         result = app_instance.summarize_url(
-            url=url.strip(),
+            url=url,
             format=format_choice,
             title=custom_title.strip() if custom_title and custom_title.strip() else None,
             force_audio=force_audio,
@@ -118,12 +151,12 @@ def process_url(
         )
 
         if not result['success']:
-            return f"Error: {result['error']}", "", "", None
+            return _friendly_error(result['error']), "", "", None
 
         return _format_result(result, app_instance)
 
     except Exception as e:
-        return f"Error: {str(e)}", "", "", None
+        return _friendly_error(str(e)), "", "", None
 
 
 def process_file(
@@ -135,7 +168,7 @@ def process_file(
 ):
     """Process uploaded file."""
     if file is None:
-        return "Please upload a file", "", "", None
+        return "Upload an audio or video file to get started.", "", "", None
 
     key_err = _check_api_keys()
     if key_err:
@@ -157,108 +190,88 @@ def process_file(
         )
 
         if not result['success']:
-            return f"Error: {result['error']}", "", "", None
+            return _friendly_error(result['error']), "", "", None
 
         return _format_result(result, app_instance)
 
     except Exception as e:
-        return f"Error: {str(e)}", "", "", None
+        return _friendly_error(str(e)), "", "", None
 
 
-# Custom CSS
+# ── Custom CSS ──────────────────────────────────────────────────────
 css = """
 .gradio-container {
     max-width: 1200px !important;
     margin: auto;
-}
-.status-box {
-    padding: 10px;
-    border-radius: 8px;
 }
 footer {
     visibility: hidden;
 }
 """
 
-# Build interface
+# ── Build interface ─────────────────────────────────────────────────
 with gr.Blocks(
     title="Podcast Summarizer v2.0",
-    css=css,
 ) as demo:
 
     gr.Markdown("""
     # Podcast Summarizer v2.0
-
-    **Summarize any video or podcast with AI**
-
-    Supports: YouTube, Vimeo, Twitter, TikTok, Spotify, SoundCloud, and 1000+ more sites!
-
-    ---
+    Summarize any video or podcast with AI. Paste a URL or upload a file.
     """)
 
     with gr.Row():
-        with gr.Column(scale=2):
+        with gr.Column(scale=3):
 
             with gr.Tabs() as input_tabs:
 
-                # URL Tab
                 with gr.Tab("From URL", id="url_tab"):
                     url_input = gr.Textbox(
-                        label="Enter URL",
-                        placeholder="https://www.youtube.com/watch?v=... or any supported URL",
-                        lines=1
+                        label="Video / Podcast URL",
+                        placeholder="https://www.youtube.com/watch?v=...",
+                        lines=1,
                     )
-
                     with gr.Row():
                         force_audio = gr.Checkbox(
                             label="Force audio transcription",
                             value=False,
-                            info="Skip platform captions, use Whisper"
+                            info="Skip captions, use Whisper speech recognition"
                         )
+                    url_btn = gr.Button("Summarize", variant="primary", size="lg")
 
-                    url_btn = gr.Button("Summarize URL", variant="primary", size="lg")
-
-                # File Tab
                 with gr.Tab("Upload File", id="file_tab"):
                     file_input = gr.File(
-                        label="Upload audio or video file",
+                        label="Audio or video file",
                         file_types=["audio", "video"],
                         type="filepath"
                     )
+                    file_btn = gr.Button("Summarize", variant="primary", size="lg")
 
-                    file_btn = gr.Button("Summarize File", variant="primary", size="lg")
-
-            # Common options
             with gr.Accordion("Options", open=False):
                 format_choice = gr.Radio(
                     choices=["detailed", "quick", "bullets", "chapters"],
                     value="detailed",
                     label="Summary Format",
-                    info="detailed=full, quick=brief, bullets=points only, chapters=timeline"
+                    info="detailed = full summary with chapters & quotes | quick = executive summary only | bullets = key points | chapters = timeline"
                 )
-
                 custom_title = gr.Textbox(
                     label="Custom Title (optional)",
-                    placeholder="Leave empty to auto-detect"
+                    placeholder="Leave empty to auto-detect from video"
                 )
-
                 whisper_model = gr.Dropdown(
                     choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
-                    value="base",
+                    value=_DEFAULT_WHISPER,
                     label="Whisper Model",
-                    info="For audio transcription. tiny=fastest, large-v3=best quality"
+                    info="For audio transcription. tiny = fastest, large-v3 = best quality"
                 )
 
-        # Status
-        with gr.Column(scale=1):
+        # Status sidebar
+        with gr.Column(scale=1, min_width=250):
             status_output = gr.Markdown(
+                value="**Ready.** Enter a URL or upload a file.",
                 label="Status",
-                value="Ready! Enter a URL or upload a file."
             )
 
-    gr.Markdown("---")
-
-    # Output tabs
+    # ── Output area ─────────────────────────────────────────────
     with gr.Tabs():
         with gr.Tab("Summary"):
             summary_output = gr.Markdown(label="Summary")
@@ -267,54 +280,48 @@ with gr.Blocks(
             transcript_output = gr.Textbox(
                 label="Transcript",
                 lines=20,
-                max_lines=50
+                max_lines=50,
             )
 
         with gr.Tab("Download"):
             download_output = gr.File(label="Download Summary (.md)")
 
-    # Event handlers
+    # ── Event handlers ──────────────────────────────────────────
     url_btn.click(
         fn=process_url,
         inputs=[url_input, format_choice, custom_title, force_audio, whisper_model],
-        outputs=[status_output, summary_output, transcript_output, download_output]
+        outputs=[status_output, summary_output, transcript_output, download_output],
     )
 
     file_btn.click(
         fn=process_file,
         inputs=[file_input, format_choice, custom_title, whisper_model],
-        outputs=[status_output, summary_output, transcript_output, download_output]
+        outputs=[status_output, summary_output, transcript_output, download_output],
     )
 
-    # Footer
+    # ── Footer ──────────────────────────────────────────────────
     gr.Markdown("""
     ---
+    **How it works:**
+    YouTube with captions (~5-10 s) | YouTube cloud / no captions (~30-35 s) | Other sites: audio download + Whisper + AI
 
-    **Tips:**
-    - YouTube videos with captions: ~5-10 seconds (text-only AI summary)
-    - YouTube on cloud (no captions): ~30-35 seconds (AI video analysis)
-    - Other sites: downloads audio + Whisper transcription + AI summary
-    - Use "Force audio" if captions are poor quality
-
-    **Powered by:** yt-dlp, faster-whisper, Google Gemini / Groq
+    **Powered by** yt-dlp, faster-whisper, Google Gemini, Groq
     """)
 
 
+# ── Entry point ─────────────────────────────────────────────────────
+
 def main():
-    """Launch the web interface"""
-
+    """Launch the web interface."""
     print("=" * 50)
-    print("Podcast Summarizer v2.0 - Web UI")
+    print("Podcast Summarizer v2.0")
     print("=" * 50)
 
-    # Check API key
     if not os.environ.get('GEMINI_API_KEY') and not os.environ.get('GROQ_API_KEY'):
         print("\nWarning: No API key set!")
-        print("   Set GEMINI_API_KEY (recommended) or GROQ_API_KEY")
-        print("   Gemini key: aistudio.google.com/apikey")
-        print("   Groq key: console.groq.com\n")
+        print("  Set GEMINI_API_KEY (recommended) or GROQ_API_KEY\n")
 
-    print("\nStarting server...")
+    print("Starting server...")
 
     demo.launch(
         server_name="0.0.0.0",
@@ -322,6 +329,7 @@ def main():
         share=False,
         show_error=True,
         theme=gr.themes.Soft(primary_hue="purple"),
+        css=css,
     )
 
 

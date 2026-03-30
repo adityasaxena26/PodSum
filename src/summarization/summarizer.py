@@ -130,8 +130,8 @@ class EnhancedSummarizer:
         api_key: Optional[str] = None,
         gemini_api_key: Optional[str] = None,
         provider: str = "auto",
-        model: str = "llama-3.3-70b-versatile",
-        fast_model: str = "llama-3.1-8b-instant"
+        model: str = None,
+        fast_model: str = None
     ):
         """
         Initialize summarizer.
@@ -165,8 +165,9 @@ class EnhancedSummarizer:
 
         logger.info(f"Using provider: {self.provider}")
 
-        self.model = model
-        self.fast_model = fast_model
+        self.gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        self.model = model or os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        self.fast_model = fast_model or os.environ.get("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
         self._groq_client = None
         self._gemini_client = None
 
@@ -202,7 +203,7 @@ class EnhancedSummarizer:
             try:
                 client = self._get_gemini_client()
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash-lite",
+                    model=self.gemini_model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.3,
@@ -676,16 +677,38 @@ IMPORTANT: Previous response had JSON errors.
                 except (json.JSONDecodeError, ValueError):
                     continue
 
-        # Try finding JSON object
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
-            try:
-                # Fix trailing commas
-                fixed = re.sub(r',\s*([}\]])', r'\1', match.group(0))
-                return json.loads(fixed)
-            except (json.JSONDecodeError, ValueError):
-                pass
-        
+        # Try finding JSON object with balanced brace matching
+        start = text.find('{')
+        if start != -1:
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(text)):
+                c = text[i]
+                if escape:
+                    escape = False
+                    continue
+                if c == '\\' and in_string:
+                    escape = True
+                    continue
+                if c == '"' and not escape:
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        fixed = re.sub(r',\s*([}\]])', r'\1', candidate)
+                        return json.loads(fixed)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    break
+
         return None
     
     def _summarize_long(

@@ -59,6 +59,11 @@ from src.summarization.summarizer import (
 groq_api_key = os.getenv("GROQ_API_KEY")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 
+# Centralized model config — change here or via env vars
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
+
 class PodcastSummarizerV2:
     """
     Main application class for Podcast Summarizer v2.
@@ -288,7 +293,7 @@ class PodcastSummarizerV2:
         schema = EnhancedSummarizer.get_format_schema(summary_format, content_type)
         # Reuse the summarizer's Gemini client (lazy-loaded singleton)
         client = self.summarizer._get_gemini_client()
-        MODEL = 'gemini-2.5-flash-lite'  # No thinking overhead, fast structured output
+        MODEL = GEMINI_MODEL
 
         try:
             # ── Path A: Transcript available → text-only (~5-8s) ────
@@ -525,32 +530,18 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
         """Format results as markdown"""
         
         lines = []
-        
-        # Header
+
+        # Title
         lines.append(f"# {summary.title or 'Summary'}")
         lines.append("")
-        
-        # Metadata
-        lines.append("## Metadata")
-        lines.append("")
-        lines.append(f"- **Source:** {transcript.source.value}")
-        lines.append(f"- **Platform:** {transcript.platform}")
-        lines.append(f"- **Duration:** {transcript.duration_minutes:.1f} minutes")
-        lines.append(f"- **Content Type:** {summary.content_type.value}")
-        lines.append(f"- **Words:** {summary.word_count_original:,}")
-        lines.append(f"- **Compression:** {summary.compression_ratio:.1f}x")
-        lines.append(f"- **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        lines.append("")
-        
-        # Executive Summary
+
+        # Executive Summary first (the most important content)
         if summary.executive_summary:
-            lines.append("---")
-            lines.append("")
             lines.append("## Executive Summary")
             lines.append("")
             lines.append(summary.executive_summary)
             lines.append("")
-        
+
         # Key Takeaways
         if summary.key_takeaways:
             lines.append("---")
@@ -560,7 +551,7 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
             for i, t in enumerate(summary.key_takeaways, 1):
                 lines.append(f"{i}. {t}")
             lines.append("")
-        
+
         # Chapters
         if summary.chapters:
             lines.append("---")
@@ -572,7 +563,7 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
                 lines.append("")
                 lines.append(ch.summary)
                 lines.append("")
-        
+
         # Notable Quotes
         if summary.notable_quotes:
             lines.append("---")
@@ -587,16 +578,16 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
                     lines.append(f">")
                     lines.append(f"> *{q.context}*")
                 lines.append("")
-        
+
         # Topics
         if summary.topics:
             lines.append("---")
             lines.append("")
             lines.append("## Topics")
             lines.append("")
-            lines.append(" • ".join([f"`{t}`" for t in summary.topics]))
+            lines.append(" ".join([f"`{t}`" for t in summary.topics]))
             lines.append("")
-        
+
         # Action Items
         if summary.action_items:
             lines.append("---")
@@ -606,7 +597,19 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
             for item in summary.action_items:
                 lines.append(f"- [ ] {item}")
             lines.append("")
-        
+
+        # Metadata at the bottom (reference info, not primary content)
+        lines.append("---")
+        lines.append("")
+        lines.append(
+            f"*{transcript.source.value} | {transcript.platform} | "
+            f"{transcript.duration_minutes:.1f} min | "
+            f"{summary.word_count_original:,} words | "
+            f"{summary.compression_ratio:.1f}x compression | "
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M')}*"
+        )
+        lines.append("")
+
         return "\n".join(lines)
     
     def format_json(
