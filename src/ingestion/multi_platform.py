@@ -190,10 +190,37 @@ class MultiPlatformFetcher:
         # Track tier errors so the final error message shows what was tried
         tier_errors = []
 
-        # TIER 1: Try platform transcripts (if enabled and not forced to audio)
+        # ── Smart tier ordering ──────────────────────────────────
+        # On cloud servers (GCP, AWS, etc.), YouTube blocks captions API
+        # and yt-dlp audio download. Gemini transcription (googleapis.com)
+        # is the ONLY reliable method. So we try it FIRST to avoid
+        # wasting 30-60s on doomed requests.
+        #
+        # Order:
+        #   1. Gemini transcription (always works on cloud — fastest path)
+        #   2. YouTube captions API (works locally, blocked on cloud)
+        #   3. Audio download + Whisper (works locally, blocked on cloud)
+
         if self.prefer_transcripts and not force_audio:
+            # TIER 1: Gemini transcription (googleapis.com — never blocked)
+            # Try this FIRST because it's the only reliable method on cloud.
+            if platform == Platform.YOUTUBE and os.environ.get('GEMINI_API_KEY'):
+                if progress_callback:
+                    progress_callback("Transcribing via Gemini...", 0.1)
+                logger.info("Tier 1: Gemini YouTube transcription (googleapis.com)")
+                result = self._fetch_transcript_via_gemini(url)
+                if result.success:
+                    logger.info(f"✅ Got transcript via Gemini: {result.word_count:,} words")
+                    if progress_callback:
+                        progress_callback("Transcript fetched", 1.0)
+                    return result
+                tier_errors.append(f"Gemini transcription: {result.error}")
+                logger.warning(f"Tier 1 (Gemini) failed: {result.error}")
+
+            # TIER 2: YouTube captions API (free, instant — but blocked on cloud IPs)
             if progress_callback:
-                progress_callback("Checking for existing transcript", 0.1)
+                progress_callback("Trying captions API...", 0.2)
+            logger.info("Tier 2: YouTube captions API")
 
             result = self._try_platform_transcript(url, platform)
             if result.success:
@@ -203,30 +230,10 @@ class MultiPlatformFetcher:
                 return result
 
             tier_errors.append(f"Captions API: {result.error}")
-            logger.info(f"Tier 1 failed: {result.error}")
+            logger.info(f"Tier 2 (captions) failed: {result.error}")
 
-            # TIER 1.5: Gemini transcription (YouTube URL → googleapis.com → transcript)
-            # Gemini natively processes YouTube URLs via Google's internal infra.
-            # All traffic goes through googleapis.com — never touches youtube.com,
-            # so it is NEVER blocked on GCP / cloud IPs.
-            if platform == Platform.YOUTUBE and os.environ.get('GEMINI_API_KEY'):
-                if progress_callback:
-                    progress_callback("Transcribing via Gemini", 0.15)
-                logger.info("Trying Gemini YouTube transcription (googleapis.com)...")
-                result = self._fetch_transcript_via_gemini(url)
-                if result.success:
-                    logger.info("✅ Got transcript via Gemini")
-                    if progress_callback:
-                        progress_callback("Transcript fetched", 1.0)
-                    return result
-                tier_errors.append(f"Gemini transcription: {result.error}")
-                logger.warning(f"Tier 1.5 failed: {result.error}")
-            elif platform == Platform.YOUTUBE:
-                tier_errors.append("Gemini: GEMINI_API_KEY not set")
-                logger.warning("⚠️ GEMINI_API_KEY not set — skipping Gemini transcription")
-
-        # TIER 2: Audio fallback
-        logger.info("Falling back to audio download + transcription...")
+        # TIER 3: Audio fallback (yt-dlp + Whisper — blocked on cloud)
+        logger.info("Tier 3: Audio download + Whisper transcription")
         result = self._audio_fallback(url, platform, progress_callback)
         if result.success:
             return result
@@ -490,9 +497,9 @@ class MultiPlatformFetcher:
             response = client.models.generate_content(
                 model=os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash'),
                 contents=[
-                    genai.types.Part.from_uri(  # genai imported at top of method
+                    genai.types.Part.from_uri(
                         file_uri=canonical_url,
-                        mime_type='video/*',
+                        mime_type='video/x-youtube',
                     ),
                     (
                         "Transcribe every word spoken in this video verbatim. "

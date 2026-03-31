@@ -370,7 +370,13 @@ class PodcastSummarizerV2:
         yt_api_key = os.environ.get('YOUTUBE_API_KEY')
 
         def _fetch_transcript():
-            return self.fetcher._fetch_youtube_transcript(url)
+            """Try captions API first (instant & free), fall back to Gemini transcription."""
+            result = self.fetcher._fetch_youtube_transcript(url)
+            if result and result.success:
+                return result
+            # Captions API failed (likely blocked on cloud) — try Gemini transcription
+            logger.info("Captions API failed in fast path, trying Gemini transcription...")
+            return self.fetcher._fetch_transcript_via_gemini(url)
 
         def _fetch_metadata():
             if yt_api_key:
@@ -381,7 +387,7 @@ class PodcastSummarizerV2:
             ft_transcript = executor.submit(_fetch_transcript)
             ft_metadata = executor.submit(_fetch_metadata)
             try:
-                yt_transcript = ft_transcript.result(timeout=15)
+                yt_transcript = ft_transcript.result(timeout=60)
                 if not (yt_transcript and yt_transcript.success):
                     yt_transcript = None
             except Exception as e:
