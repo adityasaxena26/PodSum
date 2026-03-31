@@ -336,14 +336,17 @@ class PodcastSummarizerV2:
                 if progress_callback:
                     progress_callback("Summarizing with AI...", 0.3)
 
-                # For very long transcripts (>60 min / ~8000 words),
+                # For very long transcripts (>90 min / ~15000 words),
                 # use Gemini video mode instead of text — it's faster
                 # because Gemini processes the video natively through
                 # Google's infrastructure rather than reading a huge
                 # text prompt token-by-token.
+                # After deduplication, a 60-min video is ~9K words which
+                # Gemini flash processes in <10s. Only switch to video
+                # for genuinely long podcasts (2+ hours).
                 use_video_for_long = (
-                    yt_transcript.word_count > 8000
-                    and duration_min > 60
+                    yt_transcript.word_count > 15000
+                    and duration_min > 90
                 )
 
                 if use_video_for_long:

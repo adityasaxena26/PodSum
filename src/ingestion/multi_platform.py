@@ -333,7 +333,6 @@ class MultiPlatformFetcher:
             raw_segments = transcript.fetch()
 
             segments = []
-            text_parts = []
             for seg in raw_segments:
                 if hasattr(seg, 'text'):
                     # v1.x: FetchedTranscriptSnippet with .text, .start, .duration
@@ -342,10 +341,20 @@ class MultiPlatformFetcher:
                     # v0.x: dict with 'text', 'start', 'duration' keys
                     text, start, duration = seg['text'], seg['start'], seg['duration']
                 segments.append(TranscriptSegment(text=text, start=start, end=start + duration))
-                text_parts.append(text)
 
-            full_text = ' '.join(text_parts)
+            # Deduplicate overlapping segments before joining.
+            # YouTube auto-captions use rolling text that can inflate
+            # word count by 10-15x if naively concatenated.
+            full_text = self._deduplicate_segments(segments)
             full_text = self._clean_text(full_text)
+
+            naive_count = sum(len(s.text.split()) for s in segments)
+            deduped_count = len(full_text.split())
+            if naive_count > 0 and deduped_count < naive_count:
+                logger.info(
+                    f"Transcript deduplication: {naive_count:,} → {deduped_count:,} words "
+                    f"({(1 - deduped_count/naive_count)*100:.0f}% reduction)"
+                )
             
             duration = segments[-1].end if segments else 0
             
@@ -1384,6 +1393,51 @@ class MultiPlatformFetcher:
             compute_type=compute_type
         )
     
+    def _deduplicate_segments(self, segments: list) -> str:
+        """
+        Deduplicate overlapping YouTube caption segments.
+
+        YouTube auto-generated captions use rolling/overlapping segments
+        where each new segment repeats words from the previous one.
+        A 30-min video can inflate from ~4,500 words to 50,000+ if
+        segments are naively concatenated.
+
+        Algorithm: word-level suffix/prefix matching. For each new segment,
+        find the longest overlap between the end of the accumulated text
+        and the start of the new segment, then append only the new portion.
+        """
+        if not segments:
+            return ""
+
+        result_words = segments[0].text.split()
+
+        for i in range(1, len(segments)):
+            new_words = segments[i].text.split()
+            if not new_words:
+                continue
+
+            # Find longest overlap: check if end of result matches start of new
+            best_overlap = 0
+            max_check = min(len(result_words), len(new_words), 40)
+            for overlap in range(1, max_check + 1):
+                if result_words[-overlap:] == new_words[:overlap]:
+                    best_overlap = overlap
+
+            # Only add the non-overlapping portion
+            if best_overlap > 0:
+                result_words.extend(new_words[best_overlap:])
+            else:
+                # No word-level overlap detected — check for time-based overlap
+                # If segments overlap in time by >50%, likely duplicate; skip
+                if i > 0 and hasattr(segments[i], 'start') and hasattr(segments[i-1], 'end'):
+                    overlap_time = segments[i-1].end - segments[i].start
+                    seg_duration = segments[i].end - segments[i].start
+                    if seg_duration > 0 and overlap_time / seg_duration > 0.5:
+                        continue  # Skip heavily overlapping segment
+                result_words.extend(new_words)
+
+        return ' '.join(result_words)
+
     def _clean_text(self, text: str) -> str:
         """Clean transcript text"""
         # Remove [Music], [Applause], etc.
