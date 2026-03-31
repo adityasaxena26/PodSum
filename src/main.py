@@ -133,6 +133,7 @@ class PodcastSummarizerV2:
         # When the URL is YouTube and Gemini is available, this avoids two
         # separate expensive Gemini calls (transcribe → summarize).
         _cached_transcript = None  # May be populated by fast path for reuse
+        _gemini_error = None       # Capture fast-path error for diagnostics
         if (
             not force_audio
             and self._is_youtube_url(url)
@@ -148,6 +149,8 @@ class PodcastSummarizerV2:
             # don't re-fetch it in the 2-step fallback below.
             if result and result.get('transcript') and result['transcript'].success:
                 _cached_transcript = result['transcript']
+            if result and result.get('error'):
+                _gemini_error = result['error']
             logger.info("Combined Gemini path failed, falling back to 2-step pipeline")
 
         # Standard 2-step path: fetch transcript, then summarize separately.
@@ -377,14 +380,17 @@ class PodcastSummarizerV2:
                         model=MODEL,
                         contents=[
                             video_part,
-                            f"""Summarize this {content_type.value}. TITLE: {video_title} | DURATION: {duration_min:.0f}min
+                            f"""Summarize this {content_type.value}. Return JSON only — no markdown.
+
+TITLE: {video_title} | DURATION: {duration_min:.0f}min
 
 {schema}
 
 TARGET: ~{target_words} words total. Cover the ENTIRE {duration_min:.0f} minutes — not just the beginning. Use specific names, numbers, claims. Quotes must be exact words spoken.""",
                         ],
                         config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
+                            # NOTE: response_mime_type is NOT used with video input —
+                            # structured output is incompatible with multimodal content.
                             max_output_tokens=8192,
                             temperature=0.1,
                         ),
@@ -435,14 +441,17 @@ TARGET: ~{target_words} words total. Be specific — use real names, numbers, cl
                     model=MODEL,
                     contents=[
                         video_part,
-                        f"""Summarize this video. TITLE: {video_title}{f" | DURATION: {duration_min:.0f}min" if duration_min else ""}
+                        f"""Summarize this video. Return JSON only — no markdown.
+
+TITLE: {video_title}{f" | DURATION: {duration_min:.0f}min" if duration_min else ""}
 
 {schema}
 
 TARGET: ~{target_words} words total. Cover the ENTIRE video. Use specific names, numbers, claims. Quotes must be exact words spoken.""",
                     ],
                     config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
+                        # NOTE: response_mime_type is NOT used with video input —
+                        # structured output is incompatible with multimodal content.
                         max_output_tokens=8192,
                         temperature=0.1,
                     ),
@@ -459,17 +468,13 @@ TARGET: ~{target_words} words total. Cover the ENTIRE video. Use specific names,
                 progress_callback("Parsing response...", 0.85)
 
             # ── Parse JSON ──────────────────────────────────────────
-            # With response_mime_type="application/json", Gemini returns
-            # clean JSON directly — no markdown wrapping to strip.
-            try:
-                summary_data = json.loads(summary_raw)
-            except json.JSONDecodeError:
-                # Safety fallback: strip markdown fences if present
-                raw = summary_raw
-                if raw.startswith('```'):
-                    raw = re.sub(r'^```(?:json)?\s*', '', raw)
-                    raw = re.sub(r'\s*```$', '', raw)
-                summary_data = json.loads(raw)
+            # Text path uses response_mime_type="application/json" (clean JSON).
+            # Video paths can't use it, so may have markdown fences.
+            raw = summary_raw
+            if raw.startswith('```'):
+                raw = re.sub(r'^```(?:json)?\s*', '', raw)
+                raw = re.sub(r'\s*```$', '', raw)
+            summary_data = json.loads(raw)
 
             # Path B: build transcript from chapters/summary (no verbatim available)
             if transcript_text is None:
