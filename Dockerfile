@@ -63,6 +63,10 @@ EXPOSE 7860
 # /tmp is writable by all users; TMPDIR overrides tempfile.gettempdir() calls.
 ENV TMPDIR=/tmp
 
+# Default Gemini model — gemini-2.0-flash is faster than flash-lite.
+# Override at deploy time with --set-env-vars GEMINI_MODEL=... if needed.
+ENV GEMINI_MODEL=gemini-2.0-flash
+
 # YouTube Data API key for fetching captions from cloud/data-center IPs.
 # Get one at: https://console.cloud.google.com/apis/credentials
 # Enable "YouTube Data API v3" in the GCP console.

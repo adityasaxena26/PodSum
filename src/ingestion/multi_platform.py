@@ -10,8 +10,7 @@ TIER 1: Platform transcripts (FREE, instant)
 TIER 2: Audio download + Whisper transcription (fallback)
     - Supports 1000+ sites via yt-dlp
     - Uses faster-whisper for efficient transcription
-llama-3.1-70b-versatile
-Version: 2.0.0
+Version: 2.2.0
 """
 
 import os
@@ -73,7 +72,16 @@ class TranscriptResult:
     
     @property
     def word_count(self) -> int:
-        return len(self.text.split())
+        # Cache the count — .split() on 50K+ char strings is not free
+        if not hasattr(self, '_word_count_cache') or self._word_count_cache is None:
+            self._word_count_cache = len(self.text.split())
+        return self._word_count_cache
+
+    def __setattr__(self, name, value):
+        # Invalidate word count cache when text changes
+        if name == 'text':
+            object.__setattr__(self, '_word_count_cache', None)
+        object.__setattr__(self, name, value)
     
     @property
     def duration_minutes(self) -> float:
@@ -138,10 +146,11 @@ class MultiPlatformFetcher:
         self.cookies_path = None  # Optional path to cookies.txt
         os.makedirs(self.temp_dir, exist_ok=True)
 
-        # Lazy-loaded components
+        # Lazy-loaded components (singletons)
         self._whisper = None
         self._yt_dlp = None
         self._gemini_client = None
+        self._yt_transcript_api = None
     
     def fetch(
         self,
@@ -288,10 +297,10 @@ class MultiPlatformFetcher:
             )
         
         try:
-            # youtube-transcript-api v1.2.x:
-            #   Constructor: YouTubeTranscriptApi()
-            #   Methods: api.list(video_id), api.fetch(video_id)
-            ytt_api = YouTubeTranscriptApi()
+            # youtube-transcript-api v1.2.x: reuse singleton
+            if self._yt_transcript_api is None:
+                self._yt_transcript_api = YouTubeTranscriptApi()
+            ytt_api = self._yt_transcript_api
             transcript_list = ytt_api.list(video_id)
 
             # Find best transcript
@@ -1145,7 +1154,9 @@ class MultiPlatformFetcher:
             segments.append(TranscriptSegment(text=seg_text, start=start, end=end))
             text_parts.append(seg_text)
 
-        full_text = self._clean_text(' '.join(text_parts))
+        # Deduplicate overlapping segments (same issue as youtube-transcript-api)
+        full_text = self._deduplicate_segments(segments) if segments else ''
+        full_text = self._clean_text(full_text)
         return segments, full_text
 
     def _extract_youtube_id(self, url: str) -> Optional[str]:

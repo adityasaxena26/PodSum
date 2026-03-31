@@ -222,7 +222,8 @@ class EnhancedSummarizer:
                     model=self.gemini_model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
-                        temperature=0.3,
+                        response_mime_type="application/json",
+                        temperature=0.1,
                         max_output_tokens=8192,
                     ),
                 )
@@ -273,48 +274,67 @@ class EnhancedSummarizer:
         return Summary(success=False, error="Gemini failed after retries")
 
     def _detect_content_type(self, transcript: str, title: str) -> ContentType:
-        """Auto-detect content type from transcript and title"""
-        text = (title + " " + transcript[:3000]).lower()
+        """Auto-detect content type from transcript and title.
 
-        # Check for interview patterns
-        interview_signals = [
-            "interview", "guest", "joining us", "welcome to the show",
-            "tell us about", "what do you think", "in your experience"
-        ]
-        if sum(1 for s in interview_signals if s in text) >= 2:
-            return ContentType.INTERVIEW
+        Uses weighted signal matching — title matches count double because
+        titles are more intentional than transcript phrases.
+        """
+        title_lower = title.lower()
+        # Use more transcript context for better detection
+        text = (title + " " + transcript[:5000]).lower()
 
-        # Check for podcast patterns
-        podcast_signals = [
-            "podcast", "episode", "today we're", "thanks for listening",
-            "subscribe", "welcome back"
-        ]
-        if sum(1 for s in podcast_signals if s in text) >= 2:
-            return ContentType.PODCAST
+        # Score each type (title matches = 2 points, transcript = 1 point)
+        scores = {}
 
-        # Check for tutorial patterns
-        tutorial_signals = [
-            "tutorial", "how to", "step by step", "let me show you",
-            "first we'll", "next we", "click on", "install"
-        ]
-        if sum(1 for s in tutorial_signals if s in text) >= 2:
-            return ContentType.TUTORIAL
+        type_signals = {
+            ContentType.INTERVIEW: [
+                "interview", "guest", "joining us", "welcome to the show",
+                "tell us about", "what do you think", "in your experience",
+                "conversation with", "talks to", "sits down with",
+                "our guest today", "thanks for joining",
+            ],
+            ContentType.PODCAST: [
+                "podcast", "episode", "today we're", "thanks for listening",
+                "subscribe", "welcome back", "this week on", "ep.", "ep ",
+                "our show", "today's episode", "weekly", "hosted by",
+            ],
+            ContentType.TUTORIAL: [
+                "tutorial", "how to", "step by step", "let me show you",
+                "first we'll", "next we", "click on", "install",
+                "guide", "walkthrough", "demo", "let's build",
+                "follow along", "in this video i'll show",
+            ],
+            ContentType.LECTURE: [
+                "lecture", "class", "students", "professor", "university",
+                "let's examine", "as we discussed", "the theory",
+                "course", "lesson", "curriculum", "textbook",
+                "academic", "research shows",
+            ],
+            ContentType.NEWS: [
+                "breaking", "reported", "according to", "officials say",
+                "news", "today's", "update", "headline", "press conference",
+                "sources say", "report", "investigation",
+            ],
+            ContentType.COMMENTARY: [
+                "i think", "my opinion", "let's talk about", "react",
+                "response to", "commentary", "take on", "thoughts on",
+                "review", "analysis", "breakdown", "hot take",
+            ],
+        }
 
-        # Check for lecture patterns
-        lecture_signals = [
-            "lecture", "class", "students", "professor", "university",
-            "let's examine", "as we discussed", "the theory"
-        ]
-        if sum(1 for s in lecture_signals if s in text) >= 2:
-            return ContentType.LECTURE
+        for ctype, signals in type_signals.items():
+            score = 0
+            for sig in signals:
+                if sig in title_lower:
+                    score += 2  # Title matches are stronger signals
+                if sig in text:
+                    score += 1
+            scores[ctype] = score
 
-        # Check for news patterns
-        news_signals = [
-            "breaking", "reported", "according to", "officials say",
-            "news", "today's", "update"
-        ]
-        if sum(1 for s in news_signals if s in text) >= 2:
-            return ContentType.NEWS
+        # Need a minimum score of 3 to classify (avoids weak matches)
+        best_type = max(scores, key=scores.get)
+        if scores[best_type] >= 3:
+            return best_type
 
         return ContentType.GENERAL
 
@@ -353,6 +373,11 @@ class EnhancedSummarizer:
                     "This is NEWS/COMMENTARY. Focus on: key facts and events, "
                     "who/what/when/where/why, different perspectives, implications, "
                     "and what remains unknown."
+                ),
+                ContentType.COMMENTARY: (
+                    "This is COMMENTARY/ANALYSIS. Focus on: the creator's main thesis, "
+                    "supporting arguments and evidence, counterpoints addressed, "
+                    "key opinions expressed, and final conclusions or recommendations."
                 ),
             }
             ct_focus = ct_map.get(content_type, "")
@@ -395,16 +420,18 @@ class EnhancedSummarizer:
     def detect_content_type_from_title(title: str) -> 'ContentType':
         """Quick content-type detection from title alone (for fast path)."""
         t = title.lower()
-        if any(w in t for w in ['interview', 'guest', 'conversation with', 'talks to']):
+        if any(w in t for w in ['interview', 'guest', 'conversation with', 'talks to', 'sits down with']):
             return ContentType.INTERVIEW
-        if any(w in t for w in ['podcast', 'episode', 'ep.', 'ep ']):
+        if any(w in t for w in ['podcast', 'episode', 'ep.', 'ep ', 'hosted by']):
             return ContentType.PODCAST
-        if any(w in t for w in ['tutorial', 'how to', 'guide', 'learn', 'course']):
+        if any(w in t for w in ['tutorial', 'how to', 'guide', 'learn', 'course', 'walkthrough']):
             return ContentType.TUTORIAL
-        if any(w in t for w in ['lecture', 'class', 'lesson']):
+        if any(w in t for w in ['lecture', 'class', 'lesson', 'professor']):
             return ContentType.LECTURE
-        if any(w in t for w in ['news', 'breaking', 'update', 'report']):
+        if any(w in t for w in ['news', 'breaking', 'update', 'report', 'headline']):
             return ContentType.NEWS
+        if any(w in t for w in ['review', 'react', 'commentary', 'breakdown', 'analysis', 'opinion']):
+            return ContentType.COMMENTARY
         return ContentType.GENERAL
 
     def _build_prompt(
@@ -457,6 +484,14 @@ Focus on:
 - Implications and analysis
 - What remains unknown""",
 
+            ContentType.COMMENTARY: """
+Focus on:
+- The creator's main thesis or argument
+- Supporting evidence and examples
+- Counterpoints addressed
+- Key opinions and hot takes
+- Final conclusions or recommendations""",
+
             ContentType.GENERAL: """
 Focus on:
 - Main topics covered
@@ -472,27 +507,19 @@ Focus on:
         structure = self.get_format_schema(format, content_type)
 
 
-        return f"""You are an expert content analyst. Produce a high-quality, insightful summary of this {content_type.value} transcript.
+        # Target summary word count based on duration
+        target_words = max(400, int(duration * 15)) if duration > 0 else 500
 
-{"TITLE: " + title if title else ""}
-{"DURATION: " + f"{duration:.0f} minutes" if duration else ""}
-CONTENT TYPE: {content_type.value}
-
+        return f"""Summarize this {content_type.value}. TITLE: {title}{f" | DURATION: {duration:.0f}min" if duration else ""}
 {type_instruction}
 
-TRANSCRIPT:
+---TRANSCRIPT---
 {transcript}
+---END---
 
 {structure}
 
-QUALITY RULES:
-1. Return ONLY valid JSON - no markdown, no extra text
-2. Start with {{ and end with }}
-3. Be SPECIFIC: reference actual names, numbers, claims, and examples from the content
-4. NEVER use generic filler like "interesting discussion" or "various topics" — always state WHAT was discussed
-5. For executive_summary: explain what this is about, the key arguments/ideas, and why it matters
-6. For key_takeaways: each must be a standalone insight with concrete details
-7. For quotes: use EXACT words from the transcript, not paraphrases"""
+TARGET: ~{target_words} words total. Be SPECIFIC: real names, numbers, claims from the transcript. No generic filler. Quotes must be exact words spoken."""
 
     def _add_format_hint(self, prompt: str) -> str:
         """Add formatting hint after failed parse"""

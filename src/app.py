@@ -16,6 +16,7 @@ Version: 2.0.0
 import gradio as gr
 import os
 import sys
+import time
 import tempfile
 import threading
 from pathlib import Path
@@ -152,6 +153,7 @@ def process_url(
         progress(pct, desc=msg)
 
     try:
+        t_start = time.time()
         result = app_instance.summarize_url(
             url=url,
             format=format_choice,
@@ -159,11 +161,15 @@ def process_url(
             force_audio=force_audio,
             progress_callback=update_progress
         )
+        elapsed = time.time() - t_start
 
         if not result['success']:
             return _friendly_error(result['error']), "", "", None
 
-        return _format_result(result, app_instance)
+        status, summary_md, transcript_text, download_path = _format_result(result, app_instance)
+        # Append timing to status
+        status += f"\n| Time | {elapsed:.1f}s |"
+        return status, summary_md, transcript_text, download_path
 
     except Exception as e:
         return _friendly_error(str(e)), "", "", None
@@ -191,6 +197,7 @@ def process_file(
 
     try:
         file_path = file.name if hasattr(file, 'name') else file
+        t_start = time.time()
 
         result = app_instance.summarize_file(
             file_path=file_path,
@@ -198,11 +205,14 @@ def process_file(
             title=custom_title.strip() if custom_title and custom_title.strip() else None,
             progress_callback=update_progress
         )
+        elapsed = time.time() - t_start
 
         if not result['success']:
             return _friendly_error(result['error']), "", "", None
 
-        return _format_result(result, app_instance)
+        status, summary_md, transcript_text, download_path = _format_result(result, app_instance)
+        status += f"\n| Time | {elapsed:.1f}s |"
+        return status, summary_md, transcript_text, download_path
 
     except Exception as e:
         return _friendly_error(str(e)), "", "", None
