@@ -62,7 +62,7 @@ from src.summarization.summarizer import (
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 
 # Centralized model config — change here or via env vars
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 class PodcastSummarizerV2:
     """
@@ -461,7 +461,7 @@ class PodcastSummarizerV2:
                         progress_callback("AI analyzing video...", 0.2)
 
                     video_part = types.Part.from_uri(
-                        file_uri=canonical_url, mime_type='video/*',
+                        file_uri=canonical_url, mime_type='video/x-youtube',
                     )
                     max_tokens = self._FORMAT_MAX_TOKENS.get(
                         summary_format.value, 8192
@@ -546,7 +546,7 @@ TARGET: ~{target_words} words total. Be specific — use real names, numbers, cl
                 logger.info(f"Path B: video → {MODEL}")
 
                 video_part = types.Part.from_uri(
-                    file_uri=canonical_url, mime_type='video/*',
+                    file_uri=canonical_url, mime_type='video/x-youtube',
                 )
                 max_tokens = self._FORMAT_MAX_TOKENS.get(
                     summary_format.value, 8192
