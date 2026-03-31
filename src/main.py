@@ -55,7 +55,8 @@ from src.summarization.summarizer import (
     SummaryFormat,
     ContentType,
     Chapter,
-    Quote
+    Quote,
+    _count_summary_words,
 )
 
 gemini_api_key = os.getenv("GEMINI_API_KEY")
@@ -243,8 +244,11 @@ class PodcastSummarizerV2:
     _WINDOW_THRESHOLD_WORDS = 8000  # ~10K tokens
 
     @staticmethod
-    def _window_transcript(text: str, max_words: int = 8000) -> str:
+    def _window_transcript(text: str, max_words: int = 8000) -> tuple:
         """Return a strategically sampled transcript that fits within max_words.
+
+        Returns:
+            (windowed_text, was_windowed) tuple to avoid re-splitting.
 
         Strategy:
           - First 15% of words (intro / context setting)
@@ -256,8 +260,9 @@ class PodcastSummarizerV2:
         is a no-op; it only kicks in for 60+ min content.
         """
         words = text.split()
-        if len(words) <= max_words:
-            return text
+        total = len(words)
+        if total <= max_words:
+            return text, False
 
         intro_size = int(max_words * 0.15)
         outro_size = int(max_words * 0.15)
@@ -267,18 +272,14 @@ class PodcastSummarizerV2:
         outro = words[-outro_size:]
 
         # Sample evenly from the middle section
-        middle_start = intro_size
-        middle_end = len(words) - outro_size
-        middle_words = words[middle_start:middle_end]
+        middle_words = words[intro_size:total - outro_size]
 
         if len(middle_words) <= middle_budget:
             middle = middle_words
         else:
             # Pick evenly-spaced chunks (500 words each) from the middle
             chunk_size = 500
-            num_chunks = middle_budget // chunk_size
-            if num_chunks < 1:
-                num_chunks = 1
+            num_chunks = max(1, middle_budget // chunk_size)
             step = len(middle_words) // num_chunks
             middle = []
             for i in range(num_chunks):
@@ -288,7 +289,8 @@ class PodcastSummarizerV2:
                     break
             middle = middle[:middle_budget]
 
-        return ' '.join(intro) + ' [...] ' + ' '.join(middle) + ' [...] ' + ' '.join(outro)
+        return (' '.join(intro) + ' [...] ' + ' '.join(middle)
+                + ' [...] ' + ' '.join(outro)), True
 
     # ── Adaptive output token limits ───────────────────────────
     # Smaller formats don't need 8192 tokens. Lower caps = faster generation.
@@ -471,14 +473,13 @@ TARGET: ~{target_words} words total. Cover the ENTIRE {duration_min:.0f} minutes
                 else:
                     # Path A: text transcript → fast text summary
                     # Apply windowing for long transcripts to cut input tokens
-                    input_text = self._window_transcript(
+                    input_text, windowed = self._window_transcript(
                         yt_transcript.text, self._WINDOW_THRESHOLD_WORDS
                     )
-                    windowed = len(input_text.split()) < yt_transcript.word_count
                     if windowed:
                         logger.info(
                             f"Path A: windowed {yt_transcript.word_count:,} → "
-                            f"{len(input_text.split()):,} words → {MODEL}"
+                            f"~{self._WINDOW_THRESHOLD_WORDS:,} words → {MODEL}"
                         )
                     else:
                         logger.info(f"Path A: {yt_transcript.word_count:,} words → {MODEL}")
@@ -603,18 +604,8 @@ TARGET: ~{target_words} words total. Cover the ENTIRE video. Use specific names,
                 url=canonical_url,
             )
 
-            # Count ALL summary output words (not just executive_summary)
-            # for an accurate compression ratio
-            summary_word_count = len(summary_data.get('executive_summary', '').split())
-            for t in summary_data.get('key_takeaways', []):
-                summary_word_count += len(str(t).split())
-            for ch in summary_data.get('chapters', []):
-                if isinstance(ch, dict):
-                    summary_word_count += len(ch.get('summary', '').split())
-                    summary_word_count += len(ch.get('title', '').split())
-            for q in summary_data.get('notable_quotes', []):
-                if isinstance(q, dict):
-                    summary_word_count += len(q.get('text', '').split())
+            # Count ALL summary output words for accurate compression ratio
+            summary_word_count = _count_summary_words(summary_data)
 
             summary_result = Summary(
                 success=True,

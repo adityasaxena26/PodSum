@@ -151,6 +151,7 @@ class MultiPlatformFetcher:
         self._yt_dlp = None
         self._gemini_client = None
         self._yt_transcript_api = None
+        self._http_client = None  # Reusable httpx client with connection pooling
     
     def fetch(
         self,
@@ -251,6 +252,34 @@ class MultiPlatformFetcher:
                 raise ValueError("GEMINI_API_KEY not set")
             self._gemini_client = genai.Client(api_key=api_key)
         return self._gemini_client
+
+    def _get_http_client(self):
+        """Reusable httpx client with connection pooling.
+
+        A single client reuses TCP connections across requests,
+        eliminating per-request connection setup overhead (~50-100ms each).
+        This matters because the fallback tiers can make 5-8 HTTP requests.
+        """
+        if self._http_client is None:
+            import httpx
+            self._http_client = httpx.Client(
+                follow_redirects=True,
+                timeout=30,
+                # Connection pooling: keep connections alive for reuse
+                limits=httpx.Limits(
+                    max_keepalive_connections=5,
+                    max_connections=10,
+                    keepalive_expiry=30,
+                ),
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                },
+            )
+        return self._http_client
 
     def _detect_platform(self, url: str) -> Platform:
         """Detect platform from URL"""
@@ -695,10 +724,10 @@ class MultiPlatformFetcher:
                     if '&fmt=' not in base_url:
                         base_url += '&fmt=json3'
 
-                    with httpx.Client(follow_redirects=True, timeout=30) as client:
-                        resp = client.get(base_url)
-                        resp.raise_for_status()
-                        data = resp.json()
+                    http = self._get_http_client()
+                    resp = http.get(base_url)
+                    resp.raise_for_status()
+                    data = resp.json()
 
                     segments, full_text = self._parse_json3_captions(data)
                     if full_text:
@@ -735,8 +764,6 @@ class MultiPlatformFetcher:
         These are third-party YouTube frontend proxies that run on non-GCP IPs,
         so they are not blocked by YouTube's bot detection.
         """
-        import httpx
-
         # Multiple instances for redundancy — if one is down, try the next
         piped_instances = [
             "https://pipedapi.kavin.rocks",
@@ -750,13 +777,14 @@ class MultiPlatformFetcher:
         ]
 
         # --- Try Piped first ---
+        http = self._get_http_client()
+
         for base in piped_instances:
             try:
-                with httpx.Client(timeout=10, follow_redirects=True) as client:
-                    resp = client.get(f"{base}/streams/{video_id}")
-                    if resp.status_code != 200:
-                        continue
-                    data = resp.json()
+                resp = http.get(f"{base}/streams/{video_id}", timeout=10)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
 
                 subtitles = data.get('subtitles', [])
                 if not subtitles:
@@ -770,11 +798,10 @@ class MultiPlatformFetcher:
                     continue
 
                 # Download the subtitle content (VTT format)
-                with httpx.Client(timeout=15, follow_redirects=True) as client:
-                    sub_resp = client.get(sub_url)
-                    if sub_resp.status_code != 200:
-                        continue
-                    vtt_text = sub_resp.text
+                sub_resp = http.get(sub_url, timeout=15)
+                if sub_resp.status_code != 200:
+                    continue
+                vtt_text = sub_resp.text
 
                 segments, full_text = self._parse_vtt_captions(vtt_text)
                 if full_text and len(full_text.strip()) > 50:
@@ -800,11 +827,10 @@ class MultiPlatformFetcher:
         # --- Try Invidious ---
         for base in invidious_instances:
             try:
-                with httpx.Client(timeout=10, follow_redirects=True) as client:
-                    resp = client.get(f"{base}/api/v1/captions/{video_id}")
-                    if resp.status_code != 200:
-                        continue
-                    data = resp.json()
+                resp = http.get(f"{base}/api/v1/captions/{video_id}", timeout=10)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
 
                 captions = data.get('captions', [])
                 if not captions:
@@ -816,11 +842,10 @@ class MultiPlatformFetcher:
                     continue
 
                 # Download the caption content
-                with httpx.Client(timeout=15, follow_redirects=True) as client:
-                    sub_resp = client.get(cap_url, params={"label": ""})
-                    if sub_resp.status_code != 200:
-                        continue
-                    vtt_text = sub_resp.text
+                sub_resp = http.get(cap_url, params={"label": ""}, timeout=15)
+                if sub_resp.status_code != 200:
+                    continue
+                vtt_text = sub_resp.text
 
                 segments, full_text = self._parse_vtt_captions(vtt_text)
                 if full_text and len(full_text.strip()) > 50:
@@ -954,9 +979,8 @@ class MultiPlatformFetcher:
         This endpoint is lighter than the player page and often works from
         cloud IPs even when the main player triggers bot detection.
         """
-        import httpx
-
         url = f"https://www.youtube.com/watch?v={video_id}"
+        http = self._get_http_client()
         langs_to_try = ['en', 'en-US', 'en-GB']
 
         for lang in langs_to_try:
@@ -970,24 +994,14 @@ class MultiPlatformFetcher:
                     if kind:
                         params['kind'] = kind
 
-                    with httpx.Client(
+                    resp = http.get(
+                        "https://www.youtube.com/api/timedtext",
+                        params=params,
                         timeout=15,
-                        follow_redirects=True,
-                        headers={
-                            "User-Agent": (
-                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/120.0.0.0 Safari/537.36"
-                            )
-                        }
-                    ) as client:
-                        resp = client.get(
-                            "https://www.youtube.com/api/timedtext",
-                            params=params,
-                        )
-                        if resp.status_code != 200:
-                            continue
-                        data = resp.json()
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
 
                     segments, full_text = self._parse_json3_captions(data)
                     if full_text and len(full_text.strip()) > 50:
@@ -1012,16 +1026,14 @@ class MultiPlatformFetcher:
 
     def _yt_data_api_metadata(self, video_id: str, api_key: str) -> dict:
         """Fetch video metadata via YouTube Data API v3 (works with API key)."""
-        import httpx
-
         url = (
             "https://www.googleapis.com/youtube/v3/videos"
             f"?part=snippet,contentDetails&id={video_id}&key={api_key}"
         )
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
+        http = self._get_http_client()
+        resp = http.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
 
         if not data.get('items'):
             return {}
@@ -1046,8 +1058,7 @@ class MultiPlatformFetcher:
         h, m, s = (int(g) if g else 0 for g in match.groups())
         return h * 3600 + m * 60 + s
 
-    @staticmethod
-    def _innertube_caption_tracks(video_id: str) -> list:
+    def _innertube_caption_tracks(self, video_id: str) -> list:
         """
         Get caption tracks via YouTube innertube player API.
         Tries multiple client types to bypass bot detection on cloud IPs:
@@ -1055,7 +1066,7 @@ class MultiPlatformFetcher:
         2. TV_EMBEDDED client — embedded player, lighter bot detection
         3. WEB client — standard, most likely to be blocked on GCP
         """
-        import httpx
+        http = self._get_http_client()
 
         clients = [
             {
@@ -1092,15 +1103,15 @@ class MultiPlatformFetcher:
                         "(Linux; U; Android 11) gzip"
                     )
 
-                with httpx.Client(timeout=15) as http:
-                    resp = http.post(
-                        "https://www.youtube.com/youtubei/v1/player"
-                        "?prettyPrint=false",
-                        json=payload,
-                        headers=headers,
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
+                resp = http.post(
+                    "https://www.youtube.com/youtubei/v1/player"
+                    "?prettyPrint=false",
+                    json=payload,
+                    headers=headers,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
                 # Check for bot/sign-in errors in the response
                 playability = data.get('playabilityStatus', {})

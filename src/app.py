@@ -405,7 +405,13 @@ def main():
 
     print("Starting server...")
 
-    demo.launch(
+    # Queue config: enables streaming generators and concurrent request handling.
+    # default_concurrency_limit=2 allows 2 summaries in parallel (Gemini API
+    # is the bottleneck, not CPU). max_size=20 prevents queue explosion.
+    demo.queue(
+        max_size=20,
+        default_concurrency_limit=2,
+    ).launch(
         server_name="0.0.0.0",
         server_port=int(os.environ.get("PORT", 7860)),
         share=False,

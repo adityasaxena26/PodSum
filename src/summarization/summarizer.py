@@ -110,6 +110,25 @@ class Summary:
         return self.word_count_original / self.word_count_summary
 
 
+def _count_summary_words(data: dict) -> int:
+    """Count ALL words across summary components in a single pass.
+
+    Used by both the combined Gemini path (main.py) and the 2-step path
+    (summarizer.py) for consistent compression ratio calculation.
+    """
+    total = len(data.get('executive_summary', '').split())
+    for t in data.get('key_takeaways', []):
+        total += len(str(t).split())
+    for ch in data.get('chapters', []):
+        if isinstance(ch, dict):
+            total += len(ch.get('summary', '').split())
+            total += len(ch.get('title', '').split())
+    for q in data.get('notable_quotes', []):
+        if isinstance(q, dict):
+            total += len(q.get('text', '').split())
+    return total
+
+
 class EnhancedSummarizer:
     """
     Intelligent summarizer using Google Gemini (1M token context).
@@ -126,6 +145,11 @@ class EnhancedSummarizer:
         >>> result = summarizer.summarize(transcript, title="My Video")
         >>> print(result.executive_summary)
     """
+
+    # Pre-compiled regex patterns — avoids re-compiling on every call
+    _RE_JSON_FENCED = re.compile(r'```json\s*([\s\S]*?)\s*```')
+    _RE_ANY_FENCED = re.compile(r'```\s*([\s\S]*?)\s*```')
+    _RE_TRAILING_COMMA = re.compile(r',\s*([}\]])')
 
     # Exponential backoff configuration
     _INITIAL_RETRY_DELAY = 1.0   # Start at 1 second
@@ -145,13 +169,15 @@ class EnhancedSummarizer:
     }
 
     @staticmethod
-    def _window_transcript(text: str, max_words: int = 8000) -> str:
+    def _window_transcript(text: str, max_words: int = 8000) -> tuple:
         """Strategic transcript sampling for long content.
+        Returns (windowed_text, was_windowed) to avoid re-splitting.
         Keeps intro (15%), evenly-spaced middle samples (70%), and outro (15%).
         """
         words = text.split()
-        if len(words) <= max_words:
-            return text
+        total = len(words)
+        if total <= max_words:
+            return text, False
 
         intro_size = int(max_words * 0.15)
         outro_size = int(max_words * 0.15)
@@ -159,7 +185,7 @@ class EnhancedSummarizer:
 
         intro = words[:intro_size]
         outro = words[-outro_size:]
-        middle_words = words[intro_size:len(words) - outro_size]
+        middle_words = words[intro_size:total - outro_size]
 
         if len(middle_words) <= middle_budget:
             middle = middle_words
@@ -175,7 +201,8 @@ class EnhancedSummarizer:
                     break
             middle = middle[:middle_budget]
 
-        return ' '.join(intro) + ' [...] ' + ' '.join(middle) + ' [...] ' + ' '.join(outro)
+        return (' '.join(intro) + ' [...] ' + ' '.join(middle)
+                + ' [...] ' + ' '.join(outro)), True
 
     def __init__(
         self,
@@ -252,14 +279,13 @@ class EnhancedSummarizer:
             logger.info(f"Detected content type: {content_type.value}")
 
         # Smart windowing for long transcripts — cuts input tokens dramatically
-        input_transcript = self._window_transcript(
+        input_transcript, windowed = self._window_transcript(
             transcript, self._WINDOW_THRESHOLD_WORDS
         )
-        windowed = len(input_transcript.split()) < word_count
         if windowed:
             logger.info(
                 f"Windowed transcript: {word_count:,} → "
-                f"{len(input_transcript.split()):,} words"
+                f"~{self._WINDOW_THRESHOLD_WORDS:,} words"
             )
 
         # Build prompt with (possibly windowed) transcript
@@ -299,16 +325,18 @@ class EnhancedSummarizer:
 
                 if result.success:
                     result.word_count_original = word_count
-                    # Count ALL summary output words for accurate compression ratio
-                    summary_words = len(result.executive_summary.split())
-                    for t in result.key_takeaways:
-                        summary_words += len(str(t).split())
-                    for ch in result.chapters:
-                        summary_words += len(ch.summary.split())
-                        summary_words += len(ch.title.split())
-                    for q in result.notable_quotes:
-                        summary_words += len(q.text.split())
-                    result.word_count_summary = summary_words
+                    # Count ALL summary output words using shared helper
+                    result.word_count_summary = _count_summary_words({
+                        'executive_summary': result.executive_summary,
+                        'key_takeaways': result.key_takeaways,
+                        'chapters': [
+                            {'summary': ch.summary, 'title': ch.title}
+                            for ch in result.chapters
+                        ],
+                        'notable_quotes': [
+                            {'text': q.text} for q in result.notable_quotes
+                        ],
+                    })
                     result.duration_minutes = duration_minutes
                     result.title = title
                     return result
@@ -648,13 +676,9 @@ IMPORTANT: Previous response had JSON errors.
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Try extracting from markdown code blocks
-        patterns = [
-            r'```json\s*([\s\S]*?)\s*```',
-            r'```\s*([\s\S]*?)\s*```',
-        ]
-        for p in patterns:
-            match = re.search(p, text)
+        # Try extracting from markdown code blocks (pre-compiled patterns)
+        for pattern in (self._RE_JSON_FENCED, self._RE_ANY_FENCED):
+            match = pattern.search(text)
             if match:
                 try:
                     return json.loads(match.group(1))
@@ -687,7 +711,7 @@ IMPORTANT: Previous response had JSON errors.
                 if depth == 0:
                     candidate = text[start:i + 1]
                     try:
-                        fixed = re.sub(r',\s*([}\]])', r'\1', candidate)
+                        fixed = self._RE_TRAILING_COMMA.sub(r'\1', candidate)
                         return json.loads(fixed)
                     except (json.JSONDecodeError, ValueError):
                         pass

@@ -73,9 +73,15 @@ ENV GEMINI_MODEL=gemini-2.0-flash
 # Set via env var at runtime (do NOT bake into the image).
 # ENV YOUTUBE_API_KEY=your-key-here
 
+# Pre-import heavy Python modules so they're in the bytecode cache.
+# This shaves ~2-3s off cold start by avoiding first-import overhead.
+RUN python -c "import google.genai; import gradio; import httpx; print('Pre-imports done')"
+
 # Health check: Gradio serves its root at / once ready.
 # start-period gives the model-loading time before probes count as failures.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
     CMD curl -sf http://localhost:7860/ > /dev/null || exit 1
 
+# Use --startup-cpu-boost when deploying to Cloud Run for faster cold starts:
+# gcloud run deploy ... --cpu-boost
 CMD ["python", "-m", "src.app"]
