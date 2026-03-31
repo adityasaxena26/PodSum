@@ -1,16 +1,18 @@
 """
 Podcast Summarizer v2.0 - Web Interface
 ========================================
-Gradio-based web UI for the podcast summarizer.
+Gradio-based web UI with streaming output for instant perceived speed.
 
 Features:
+- Streaming summary output (shows results as they generate)
+- Instant metadata preview while AI works
 - URL input for any supported platform
 - File upload for local audio/video
 - Real-time progress tracking
 - Multiple output formats
 - Download results as markdown
 
-Version: 2.0.0
+Version: 2.1.0
 """
 
 import gradio as gr
@@ -81,12 +83,8 @@ def _friendly_error(raw_error: str) -> str:
     return raw_error
 
 
-def _format_result(result, app_instance):
-    """Format a successful result into (status, summary_md, transcript, download_path)."""
-    transcript = result['transcript']
-    summary = result['summary']
-
-    # Calculate words-per-minute to show transcript quality
+def _format_status(transcript, summary, elapsed=None):
+    """Build the status markdown table from result objects."""
     wpm = (transcript.word_count / transcript.duration_minutes
            if transcript.duration_minutes > 0 else 0)
     wpm_note = ""
@@ -107,28 +105,44 @@ def _format_result(result, app_instance):
         f"| Content Type | {summary.content_type.value} |\n"
         f"| Compression | {summary.compression_ratio:.1f}x |"
     )
+    if elapsed is not None:
+        status += f"\n| Time | {elapsed:.1f}s |"
+    return status
 
-    summary_md = app_instance.format_markdown(transcript, summary)
-    transcript_text = transcript.text
 
-    # Write markdown to a temp file for download
-    download_path = None
+def _make_download(summary_md, title="summary"):
+    """Write markdown to a temp file for download. Returns path or None."""
     try:
         safe_title = "".join(
-            c for c in (summary.title or "summary") if c.isalnum() or c in " -_"
+            c for c in (title or "summary") if c.isalnum() or c in " -_"
         ).strip()[:60] or "summary"
-        fd, download_path = tempfile.mkstemp(suffix=".md", prefix=f"{safe_title}_")
+        fd, path = tempfile.mkstemp(suffix=".md", prefix=f"{safe_title}_")
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(summary_md)
+        return path
     except Exception:
-        download_path = None
+        return None
+
+
+def _format_result(result, app_instance):
+    """Format a successful result into (status, summary_md, transcript, download_path)."""
+    transcript = result['transcript']
+    summary = result['summary']
+
+    status = _format_status(transcript, summary)
+    summary_md = app_instance.format_markdown(transcript, summary)
+    transcript_text = transcript.text
+    download_path = _make_download(summary_md, summary.title)
 
     return status, summary_md, transcript_text, download_path
 
 
-# ── Processing functions ────────────────────────────────────────────
+# ── Streaming processing functions ─────────────────────────────────
+# These use Gradio generators to yield partial results progressively.
+# The user sees each piece as soon as it's ready instead of waiting
+# for the entire pipeline to finish — dramatically better perceived speed.
 
-def process_url(
+def process_url_streaming(
     url: str,
     format_choice: str,
     custom_title: str,
@@ -136,20 +150,25 @@ def process_url(
     whisper_model: str,
     progress=gr.Progress()
 ):
-    """Process URL and generate summary."""
+    """Process URL with streaming output — yields partial results progressively."""
     if not url or not url.strip():
-        return "Enter a URL above to get started.", "", "", None
+        yield "Enter a URL above to get started.", "", "", None
+        return
 
-    # Basic URL format check
     url = url.strip()
     if not url.startswith(('http://', 'https://')):
-        return "Please enter a valid URL starting with http:// or https://", "", "", None
+        yield "Please enter a valid URL starting with http:// or https://", "", "", None
+        return
 
     key_err = _check_api_keys()
     if key_err:
-        return key_err, "", "", None
+        yield key_err, "", "", None
+        return
 
     app_instance = get_app(whisper_model=whisper_model)
+
+    # Phase 1: Instant feedback — show "working" state immediately
+    yield "**Analyzing video...**", "*Fetching transcript and metadata...*", "", None
 
     def update_progress(msg, pct):
         progress(pct, desc=msg)
@@ -166,33 +185,54 @@ def process_url(
         elapsed = time.time() - t_start
 
         if not result['success']:
-            return _friendly_error(result['error']), "", "", None
+            yield _friendly_error(result['error']), "", "", None
+            return
 
-        status, summary_md, transcript_text, download_path = _format_result(result, app_instance)
-        # Append timing to status
-        status += f"\n| Time | {elapsed:.1f}s |"
-        return status, summary_md, transcript_text, download_path
+        transcript = result['transcript']
+        summary = result['summary']
+
+        # Phase 2: Show executive summary immediately (the most valuable part)
+        exec_md = f"# {summary.title or 'Summary'}\n\n"
+        exec_md += f"## Executive Summary\n\n{summary.executive_summary}\n\n"
+        phase2_status = (
+            f"**Formatting results...** ({elapsed:.1f}s)\n\n"
+            f"| | |\n|---|---|\n"
+            f"| Duration | {transcript.duration_minutes:.1f} min |\n"
+            f"| Words | {transcript.word_count:,} |"
+        )
+        yield phase2_status, exec_md, "", None
+
+        # Phase 3: Full formatted result with all sections
+        summary_md = app_instance.format_markdown(transcript, summary)
+        status = _format_status(transcript, summary, elapsed)
+        download_path = _make_download(summary_md, summary.title)
+        yield status, summary_md, transcript.text, download_path
 
     except Exception as e:
-        return _friendly_error(str(e)), "", "", None
+        yield _friendly_error(str(e)), "", "", None
 
 
-def process_file(
+def process_file_streaming(
     file,
     format_choice: str,
     custom_title: str,
     whisper_model: str,
     progress=gr.Progress()
 ):
-    """Process uploaded file."""
+    """Process uploaded file with streaming output."""
     if file is None:
-        return "Upload an audio or video file to get started.", "", "", None
+        yield "Upload an audio or video file to get started.", "", "", None
+        return
 
     key_err = _check_api_keys()
     if key_err:
-        return key_err, "", "", None
+        yield key_err, "", "", None
+        return
 
     app_instance = get_app(whisper_model=whisper_model)
+
+    # Instant feedback
+    yield "**Transcribing file...**", "*Processing audio...*", "", None
 
     def update_progress(msg, pct):
         progress(pct, desc=msg)
@@ -210,14 +250,25 @@ def process_file(
         elapsed = time.time() - t_start
 
         if not result['success']:
-            return _friendly_error(result['error']), "", "", None
+            yield _friendly_error(result['error']), "", "", None
+            return
 
-        status, summary_md, transcript_text, download_path = _format_result(result, app_instance)
-        status += f"\n| Time | {elapsed:.1f}s |"
-        return status, summary_md, transcript_text, download_path
+        transcript = result['transcript']
+        summary = result['summary']
+
+        # Phase 2: Executive summary first
+        exec_md = f"# {summary.title or 'Summary'}\n\n"
+        exec_md += f"## Executive Summary\n\n{summary.executive_summary}\n\n"
+        yield f"**Formatting...** ({elapsed:.1f}s)", exec_md, "", None
+
+        # Phase 3: Full result
+        summary_md = app_instance.format_markdown(transcript, summary)
+        status = _format_status(transcript, summary, elapsed)
+        download_path = _make_download(summary_md, summary.title)
+        yield status, summary_md, transcript.text, download_path
 
     except Exception as e:
-        return _friendly_error(str(e)), "", "", None
+        yield _friendly_error(str(e)), "", "", None
 
 
 # ── Custom CSS ──────────────────────────────────────────────────────
@@ -229,6 +280,8 @@ css = """
 footer {
     visibility: hidden;
 }
+/* Smooth transitions for streaming updates */
+.prose { transition: opacity 0.15s ease-in; }
 """
 
 # ── Build interface ─────────────────────────────────────────────────
@@ -308,16 +361,23 @@ with gr.Blocks(
         with gr.Tab("Download"):
             download_output = gr.File(label="Download Summary (.md)")
 
-    # ── Event handlers ──────────────────────────────────────────
+    # ── Event handlers (streaming) ─────────────────────────────
     url_btn.click(
-        fn=process_url,
+        fn=process_url_streaming,
         inputs=[url_input, format_choice, custom_title, force_audio, whisper_model],
         outputs=[status_output, summary_output, transcript_output, download_output],
     )
 
     file_btn.click(
-        fn=process_file,
+        fn=process_file_streaming,
         inputs=[file_input, format_choice, custom_title, whisper_model],
+        outputs=[status_output, summary_output, transcript_output, download_output],
+    )
+
+    # Allow Enter key to trigger summarization from URL input
+    url_input.submit(
+        fn=process_url_streaming,
+        inputs=[url_input, format_choice, custom_title, force_audio, whisper_model],
         outputs=[status_output, summary_output, transcript_output, download_output],
     )
 
@@ -325,7 +385,7 @@ with gr.Blocks(
     gr.Markdown("""
     ---
     **How it works:**
-    YouTube with captions (~5-10 s) | YouTube cloud / no captions (~30-35 s) | Other sites: audio download + Whisper + AI
+    YouTube with captions (~3-8 s) | YouTube cloud / no captions (~20-30 s) | Other sites: audio download + Whisper + AI
 
     **Powered by** yt-dlp, faster-whisper, Google Gemini
     """)

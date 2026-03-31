@@ -234,6 +234,71 @@ class PodcastSummarizerV2:
     # are considered too sparse and we fall back to Gemini video mode.
     _MIN_WORDS_PER_MINUTE = 50
 
+    # ── Smart transcript windowing ─────────────────────────────
+    # For transcripts longer than this, send a strategic sample to Gemini
+    # instead of the full text. This dramatically cuts input tokens
+    # (and therefore latency) while preserving summary quality.
+    # The window captures: intro (context) + evenly-spaced middle sections
+    # (body) + conclusion — the same strategy a human would use to skim.
+    _WINDOW_THRESHOLD_WORDS = 8000  # ~10K tokens
+
+    @staticmethod
+    def _window_transcript(text: str, max_words: int = 8000) -> str:
+        """Return a strategically sampled transcript that fits within max_words.
+
+        Strategy:
+          - First 15% of words (intro / context setting)
+          - Evenly spaced samples from the middle 70%
+          - Last 15% of words (conclusion / wrap-up)
+
+        This preserves the narrative arc while cutting 60-80% of tokens
+        for very long transcripts. For a 30-min video (~4,500 words) this
+        is a no-op; it only kicks in for 60+ min content.
+        """
+        words = text.split()
+        if len(words) <= max_words:
+            return text
+
+        intro_size = int(max_words * 0.15)
+        outro_size = int(max_words * 0.15)
+        middle_budget = max_words - intro_size - outro_size
+
+        intro = words[:intro_size]
+        outro = words[-outro_size:]
+
+        # Sample evenly from the middle section
+        middle_start = intro_size
+        middle_end = len(words) - outro_size
+        middle_words = words[middle_start:middle_end]
+
+        if len(middle_words) <= middle_budget:
+            middle = middle_words
+        else:
+            # Pick evenly-spaced chunks (500 words each) from the middle
+            chunk_size = 500
+            num_chunks = middle_budget // chunk_size
+            if num_chunks < 1:
+                num_chunks = 1
+            step = len(middle_words) // num_chunks
+            middle = []
+            for i in range(num_chunks):
+                start = i * step
+                middle.extend(middle_words[start:start + chunk_size])
+                if len(middle) >= middle_budget:
+                    break
+            middle = middle[:middle_budget]
+
+        return ' '.join(intro) + ' [...] ' + ' '.join(middle) + ' [...] ' + ' '.join(outro)
+
+    # ── Adaptive output token limits ───────────────────────────
+    # Smaller formats don't need 8192 tokens. Lower caps = faster generation.
+    _FORMAT_MAX_TOKENS = {
+        'quick': 2048,
+        'bullets': 2048,
+        'chapters': 4096,
+        'detailed': 8192,
+    }
+
     def _combined_gemini(
         self,
         url: str,
@@ -376,6 +441,9 @@ class PodcastSummarizerV2:
                     video_part = types.Part.from_uri(
                         file_uri=canonical_url, mime_type='video/*',
                     )
+                    max_tokens = self._FORMAT_MAX_TOKENS.get(
+                        summary_format.value, 8192
+                    )
                     resp = client.models.generate_content(
                         model=MODEL,
                         contents=[
@@ -391,7 +459,7 @@ TARGET: ~{target_words} words total. Cover the ENTIRE {duration_min:.0f} minutes
                         config=types.GenerateContentConfig(
                             # NOTE: response_mime_type is NOT used with video input —
                             # structured output is incompatible with multimodal content.
-                            max_output_tokens=8192,
+                            max_output_tokens=max_tokens,
                             temperature=0.1,
                         ),
                     )
@@ -402,16 +470,38 @@ TARGET: ~{target_words} words total. Cover the ENTIRE {duration_min:.0f} minutes
 
                 else:
                     # Path A: text transcript → fast text summary
-                    logger.info(f"Path A: {yt_transcript.word_count:,} words → {MODEL}")
+                    # Apply windowing for long transcripts to cut input tokens
+                    input_text = self._window_transcript(
+                        yt_transcript.text, self._WINDOW_THRESHOLD_WORDS
+                    )
+                    windowed = len(input_text.split()) < yt_transcript.word_count
+                    if windowed:
+                        logger.info(
+                            f"Path A: windowed {yt_transcript.word_count:,} → "
+                            f"{len(input_text.split()):,} words → {MODEL}"
+                        )
+                    else:
+                        logger.info(f"Path A: {yt_transcript.word_count:,} words → {MODEL}")
                     if progress_callback:
                         progress_callback("Summarizing with AI...", 0.3)
 
+                    # Adaptive max tokens based on format
+                    max_tokens = self._FORMAT_MAX_TOKENS.get(
+                        summary_format.value, 8192
+                    )
+
+                    windowed_note = (
+                        " NOTE: This transcript is sampled from a longer recording "
+                        f"({yt_transcript.word_count:,} words / {duration_min:.0f}min). "
+                        "Cover all time periods proportionally."
+                    ) if windowed else ""
+
                     resp = client.models.generate_content(
                         model=MODEL,
-                        contents=f"""Summarize this {content_type.value}. TITLE: {video_title}{f" | DURATION: {duration_min:.0f}min" if duration_min else ""}
+                        contents=f"""Summarize this {content_type.value}. TITLE: {video_title}{f" | DURATION: {duration_min:.0f}min" if duration_min else ""}{windowed_note}
 
 ---TRANSCRIPT---
-{yt_transcript.text}
+{input_text}
 ---END---
 
 {schema}
@@ -419,7 +509,7 @@ TARGET: ~{target_words} words total. Cover the ENTIRE {duration_min:.0f} minutes
 TARGET: ~{target_words} words total. Be specific — use real names, numbers, claims from the transcript. Quotes must be exact words spoken.""",
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
-                            max_output_tokens=8192,
+                            max_output_tokens=max_tokens,
                             temperature=0.1,
                         ),
                     )
@@ -437,6 +527,9 @@ TARGET: ~{target_words} words total. Be specific — use real names, numbers, cl
                 video_part = types.Part.from_uri(
                     file_uri=canonical_url, mime_type='video/*',
                 )
+                max_tokens = self._FORMAT_MAX_TOKENS.get(
+                    summary_format.value, 8192
+                )
                 resp = client.models.generate_content(
                     model=MODEL,
                     contents=[
@@ -452,7 +545,7 @@ TARGET: ~{target_words} words total. Cover the ENTIRE video. Use specific names,
                     config=types.GenerateContentConfig(
                         # NOTE: response_mime_type is NOT used with video input —
                         # structured output is incompatible with multimodal content.
-                        max_output_tokens=8192,
+                        max_output_tokens=max_tokens,
                         temperature=0.1,
                     ),
                 )

@@ -132,6 +132,51 @@ class EnhancedSummarizer:
     _MAX_RETRY_DELAY = 30.0      # Cap at 30 seconds
     _BACKOFF_MULTIPLIER = 2.0    # Double each retry
 
+    # Smart transcript windowing: same as main.py combined path
+    _WINDOW_THRESHOLD_WORDS = 8000
+
+    # Adaptive output token limits per format
+    _FORMAT_MAX_TOKENS = {
+        SummaryFormat.QUICK: 2048,
+        SummaryFormat.BULLETS: 2048,
+        SummaryFormat.CHAPTERS: 4096,
+        SummaryFormat.DETAILED: 8192,
+        SummaryFormat.EXECUTIVE: 2048,
+    }
+
+    @staticmethod
+    def _window_transcript(text: str, max_words: int = 8000) -> str:
+        """Strategic transcript sampling for long content.
+        Keeps intro (15%), evenly-spaced middle samples (70%), and outro (15%).
+        """
+        words = text.split()
+        if len(words) <= max_words:
+            return text
+
+        intro_size = int(max_words * 0.15)
+        outro_size = int(max_words * 0.15)
+        middle_budget = max_words - intro_size - outro_size
+
+        intro = words[:intro_size]
+        outro = words[-outro_size:]
+        middle_words = words[intro_size:len(words) - outro_size]
+
+        if len(middle_words) <= middle_budget:
+            middle = middle_words
+        else:
+            chunk_size = 500
+            num_chunks = max(1, middle_budget // chunk_size)
+            step = len(middle_words) // num_chunks
+            middle = []
+            for i in range(num_chunks):
+                start = i * step
+                middle.extend(middle_words[start:start + chunk_size])
+                if len(middle) >= middle_budget:
+                    break
+            middle = middle[:middle_budget]
+
+        return ' '.join(intro) + ' [...] ' + ' '.join(middle) + ' [...] ' + ' '.join(outro)
+
     def __init__(
         self,
         gemini_api_key: Optional[str] = None,
@@ -206,14 +251,35 @@ class EnhancedSummarizer:
             content_type = self._detect_content_type(transcript, title)
             logger.info(f"Detected content type: {content_type.value}")
 
-        # Build prompt — Gemini handles up to 1M tokens, no size check needed
-        prompt = self._build_prompt(
-            transcript, title, format, content_type, duration_minutes
+        # Smart windowing for long transcripts — cuts input tokens dramatically
+        input_transcript = self._window_transcript(
+            transcript, self._WINDOW_THRESHOLD_WORDS
         )
+        windowed = len(input_transcript.split()) < word_count
+        if windowed:
+            logger.info(
+                f"Windowed transcript: {word_count:,} → "
+                f"{len(input_transcript.split()):,} words"
+            )
+
+        # Build prompt with (possibly windowed) transcript
+        prompt = self._build_prompt(
+            input_transcript, title, format, content_type, duration_minutes
+        )
+        # Add windowing note if applicable
+        if windowed:
+            prompt = prompt.replace(
+                "---TRANSCRIPT---",
+                f"---TRANSCRIPT--- (sampled from {word_count:,} words; "
+                f"cover all {duration_minutes:.0f} minutes proportionally)"
+            )
 
         logger.info(f"Using Gemini ({len(prompt):,} chars prompt)")
 
         from google.genai import types
+
+        # Adaptive output tokens: smaller formats generate faster
+        max_tokens = self._FORMAT_MAX_TOKENS.get(format, 8192)
 
         for attempt in range(max_retries):
             try:
@@ -224,7 +290,7 @@ class EnhancedSummarizer:
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         temperature=0.1,
-                        max_output_tokens=8192,
+                        max_output_tokens=max_tokens,
                     ),
                 )
 
