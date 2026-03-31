@@ -56,13 +56,10 @@ from src.summarization.summarizer import (
     Quote
 )
 
-groq_api_key = os.getenv("GROQ_API_KEY")
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 
 # Centralized model config — change here or via env vars
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
 
 class PodcastSummarizerV2:
     """
@@ -80,25 +77,19 @@ class PodcastSummarizerV2:
 
     def __init__(
         self,
-        groq_api_key: Optional[str] = None,
         gemini_api_key: Optional[str] = None,
-        provider: str = "auto",
         whisper_model: str = "small"
     ):
         """
         Initialize the application.
 
         Args:
-            groq_api_key: Groq API key (or set GROQ_API_KEY env var)
             gemini_api_key: Gemini API key (or set GEMINI_API_KEY env var)
-            provider: "gemini", "groq", or "auto"
             whisper_model: Whisper model for audio fallback
         """
         self.fetcher = MultiPlatformFetcher(whisper_model=whisper_model)
         self.summarizer = EnhancedSummarizer(
-            api_key=groq_api_key,
             gemini_api_key=gemini_api_key,
-            provider=provider,
         )
         # Simple result cache: {cache_key: result_dict}
         # Avoids repeat API calls for same URL + format
@@ -685,7 +676,7 @@ Formats:
   chapters  - Chapter/timeline breakdown
 
 Environment Variables:
-  GROQ_API_KEY  - Your Groq API key (required)
+  GEMINI_API_KEY  - Your Gemini API key (required)
         """
     )
     
@@ -729,12 +720,6 @@ Environment Variables:
         help="Whisper model for audio (default: small)"
     )
     parser.add_argument(
-        "--provider",
-        choices=["auto", "gemini", "groq"],
-        default="auto",
-        help="LLM provider (default: auto - prefers Gemini if key available)"
-    )
-    parser.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Minimal output"
@@ -748,19 +733,13 @@ Environment Variables:
         print("\nError: Provide a URL or --file")
         sys.exit(1)
 
-    # Check API key — need at least one
-    if not args.transcript_only and not groq_api_key and not gemini_api_key:
+    # Check API key
+    if not args.transcript_only and not gemini_api_key:
         print("⚠️  No API key set!")
         print("")
-        print("Option 1 (recommended):")
         print("  1. Go to https://aistudio.google.com/apikey")
         print("  2. Create a free Gemini API key")
         print("  3. Run: export GEMINI_API_KEY='your-key'")
-        print("")
-        print("Option 2:")
-        print("  1. Go to https://console.groq.com/keys")
-        print("  2. Create a free Groq API key")
-        print("  3. Run: export GROQ_API_KEY='your-key'")
         print("")
         print("Or use --transcript-only to just get transcript.")
         sys.exit(1)
@@ -784,7 +763,6 @@ Environment Variables:
     # Initialize app
     app = PodcastSummarizerV2(
         whisper_model=args.whisper_model,
-        provider=args.provider,
     )
     
     # Transcript only mode

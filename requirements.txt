@@ -1,4 +1,4 @@
-# Podcast Summarizer v2.0 - Tier 2 (Multi-Platform + Audio Fallback)
+# Podcast Summarizer v2.1 - Multi-Platform + Gemini AI
 # Supports: YouTube, Spotify, and 1000+ sites via yt-dlp
 
 # ===================
@@ -11,14 +11,14 @@ youtube-transcript-api>=0.6.0   # YouTube captions
 # ===================
 yt-dlp>=2024.1.0                # Download from 1000+ sites
 faster-whisper>=1.0.0           # Fast transcription (4x faster than OpenAI Whisper)
-torch>=2.0.0                    # PyTorch for Whisper
+# Note: faster-whisper uses ctranslate2, NOT PyTorch, for inference.
+# Do NOT install torch unless you need GPU support with a custom setup.
 pydub>=0.25.1                   # Audio processing
 
 # ===================
-# LLM Summarization
+# LLM Summarization (Gemini only — 1M token context)
 # ===================
-google-genai>=1.0.0             # Google Gemini API (recommended, 1M token context)
-groq>=0.4.0                     # Groq API (Llama 3.1, fallback)
+google-genai>=1.0.0             # Google Gemini API
 
 # ===================
 # Utilities

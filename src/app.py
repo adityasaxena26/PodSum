@@ -49,12 +49,11 @@ def get_app(whisper_model=None):
 
 def _check_api_keys():
     """Validate API keys are set. Returns error string or None."""
-    if not os.environ.get('GEMINI_API_KEY') and not os.environ.get('GROQ_API_KEY'):
+    if not os.environ.get('GEMINI_API_KEY'):
         return (
             "**No API key configured.**\n\n"
-            "Set one of these environment variables before starting the app:\n\n"
-            "- `GEMINI_API_KEY` (recommended, free at [aistudio.google.com/apikey](https://aistudio.google.com/apikey))\n"
-            "- `GROQ_API_KEY` (free at [console.groq.com](https://console.groq.com))"
+            "Set the `GEMINI_API_KEY` environment variable before starting the app.\n\n"
+            "Get a free key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)"
         )
     return None
 
@@ -305,7 +304,7 @@ with gr.Blocks(
     **How it works:**
     YouTube with captions (~5-10 s) | YouTube cloud / no captions (~30-35 s) | Other sites: audio download + Whisper + AI
 
-    **Powered by** yt-dlp, faster-whisper, Google Gemini, Groq
+    **Powered by** yt-dlp, faster-whisper, Google Gemini
     """)
 
 
@@ -317,9 +316,9 @@ def main():
     print("Podcast Summarizer v2.0")
     print("=" * 50)
 
-    if not os.environ.get('GEMINI_API_KEY') and not os.environ.get('GROQ_API_KEY'):
+    if not os.environ.get('GEMINI_API_KEY'):
         print("\nWarning: No API key set!")
-        print("  Set GEMINI_API_KEY (recommended) or GROQ_API_KEY\n")
+        print("  Set GEMINI_API_KEY (free at https://aistudio.google.com/apikey)\n")
 
     print("Starting server...")
 

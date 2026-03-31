@@ -31,7 +31,6 @@ RUN pip install --no-cache-dir \
     "yt-dlp==2026.2.4" \
     "faster-whisper==1.2.1" \
     "google-genai==1.65.0" \
-    "groq==1.0.0" \
     "python-dotenv==1.0.1" \
     "tqdm==4.65.0" \
     "httpx==0.28.1" \

@@ -141,6 +141,7 @@ class MultiPlatformFetcher:
         # Lazy-loaded components
         self._whisper = None
         self._yt_dlp = None
+        self._gemini_client = None
     
     def fetch(
         self,
@@ -213,6 +214,16 @@ class MultiPlatformFetcher:
         logger.info("Falling back to audio download + transcription...")
         return self._audio_fallback(url, platform, progress_callback)
     
+    def _get_gemini_client(self):
+        """Lazy-load and reuse a single Gemini client (singleton per fetcher)."""
+        if self._gemini_client is None:
+            from google import genai
+            api_key = os.environ.get('GEMINI_API_KEY')
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY not set")
+            self._gemini_client = genai.Client(api_key=api_key)
+        return self._gemini_client
+
     def _detect_platform(self, url: str) -> Platform:
         """Detect platform from URL"""
         parsed = urlparse(url.lower())
@@ -380,8 +391,7 @@ class MultiPlatformFetcher:
                 error="google-genai not installed"
             )
 
-        api_key = os.environ.get('GEMINI_API_KEY')
-        if not api_key:
+        if not os.environ.get('GEMINI_API_KEY'):
             return TranscriptResult(
                 success=False, platform="youtube", url=url,
                 error="GEMINI_API_KEY not set"
@@ -397,7 +407,7 @@ class MultiPlatformFetcher:
         canonical_url = f"https://www.youtube.com/watch?v={video_id}"
 
         try:
-            client = genai.Client(api_key=api_key)
+            client = self._get_gemini_client()
 
             # Step 1: Get metadata via YouTube Data API v3 if available
             metadata = {}
@@ -414,7 +424,7 @@ class MultiPlatformFetcher:
             response = client.models.generate_content(
                 model=os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash-lite'),
                 contents=[
-                    genai.types.Part.from_uri(
+                    genai.types.Part.from_uri(  # genai imported at top of method
                         file_uri=canonical_url,
                         mime_type='video/*',
                     ),
