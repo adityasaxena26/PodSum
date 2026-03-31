@@ -216,6 +216,11 @@ class PodcastSummarizerV2:
         domain = urlparse(url.lower()).netloc
         return any(d in domain for d in ['youtube.com', 'youtu.be'])
 
+    # Minimum expected words-per-minute for a valid transcript.
+    # Normal speech is 130-170 wpm. Below this threshold, captions
+    # are considered too sparse and we fall back to Gemini video mode.
+    _MIN_WORDS_PER_MINUTE = 50
+
     def _combined_gemini(
         self,
         url: str,
@@ -226,9 +231,9 @@ class PodcastSummarizerV2:
         """
         Smart fast path for YouTube summarization.
 
-        Path A — transcript API available (local):
+        Path A — transcript API returns a GOOD transcript (>50 wpm):
           youtube-transcript-api (<1s) → flash-lite text summary (~5-8s)
-        Path B — no transcript (GCP):
+        Path B — no transcript OR sparse captions:
           single flash-lite video call (~40-50s) → summary + notes
         """
         import json, re
@@ -272,8 +277,47 @@ class PodcastSummarizerV2:
         duration = metadata.get('duration', 0)
         duration_min = duration / 60 if duration else 0
 
-        # Detect content type for tailored prompts
+        # ── Step 2.5: Validate transcript quality ───────────────────
+        # A 30-min video should have ~4000-5000 words (130-170 wpm).
+        # If captions return far fewer, they are likely sparse/partial
+        # and will produce a poor summary. Fall back to Gemini video.
+        transcript_is_good = False
         if yt_transcript and yt_transcript.success:
+            if duration_min > 0:
+                wpm = yt_transcript.word_count / duration_min
+                if wpm >= self._MIN_WORDS_PER_MINUTE:
+                    transcript_is_good = True
+                    logger.info(f"Transcript quality OK: {wpm:.0f} words/min")
+                else:
+                    logger.warning(
+                        f"Transcript too sparse: {yt_transcript.word_count} words "
+                        f"for {duration_min:.1f}min ({wpm:.0f} wpm, need ≥{self._MIN_WORDS_PER_MINUTE}). "
+                        f"Falling back to Gemini video analysis."
+                    )
+            else:
+                # No duration metadata available. Estimate from transcript:
+                # typical speech is ~150 wpm, so estimate duration and validate.
+                estimated_dur = yt_transcript.word_count / 150.0
+                if yt_transcript.word_count >= 500:
+                    transcript_is_good = True
+                    duration_min = estimated_dur
+                    logger.info(
+                        f"No duration metadata — estimated {duration_min:.1f}min "
+                        f"from {yt_transcript.word_count} words"
+                    )
+                elif yt_transcript.word_count >= 200:
+                    # Short but usable — trust it for short videos
+                    transcript_is_good = True
+                    duration_min = estimated_dur
+                    logger.info(f"Short transcript ({yt_transcript.word_count} words), using as-is")
+                else:
+                    logger.warning(
+                        f"Transcript too short ({yt_transcript.word_count} words) "
+                        f"and no duration metadata. Falling back to video."
+                    )
+
+        # Detect content type for tailored prompts
+        if transcript_is_good:
             content_type = self.summarizer._detect_content_type(
                 yt_transcript.text, video_title
             )
@@ -287,16 +331,67 @@ class PodcastSummarizerV2:
         MODEL = GEMINI_MODEL
 
         try:
-            # ── Path A: Transcript available → text-only (~5-8s) ────
-            if yt_transcript and yt_transcript.success:
+            # ── Path A: Good transcript → text-only (~5-8s) ────────
+            if transcript_is_good:
                 if progress_callback:
                     progress_callback("Summarizing with AI...", 0.3)
 
-                logger.info(f"Path A: text→{MODEL} ({content_type.value})")
+                # For very long transcripts (>60 min / ~8000 words),
+                # use Gemini video mode instead of text — it's faster
+                # because Gemini processes the video natively through
+                # Google's infrastructure rather than reading a huge
+                # text prompt token-by-token.
+                use_video_for_long = (
+                    yt_transcript.word_count > 8000
+                    and duration_min > 60
+                )
 
-                resp = client.models.generate_content(
-                    model=MODEL,
-                    contents=f"""Summarize this {content_type.value}. Return JSON only.
+                if use_video_for_long:
+                    logger.info(
+                        f"Path A-Video: transcript is {yt_transcript.word_count} words "
+                        f"({duration_min:.0f}min), using Gemini video mode for speed"
+                    )
+                    if progress_callback:
+                        progress_callback("AI is analyzing the video...", 0.2)
+
+                    video_part = types.Part.from_uri(
+                        file_uri=canonical_url, mime_type='video/*',
+                    )
+                    resp = client.models.generate_content(
+                        model=MODEL,
+                        contents=[
+                            video_part,
+                            f"""Summarize this {content_type.value} thoroughly. Return JSON only.
+
+TITLE: {video_title}
+DURATION: {duration_min:.0f}min
+
+{schema}
+
+CRITICAL: This is a long {content_type.value} ({duration_min:.0f} minutes). Be comprehensive.
+- Cover ALL major topics and segments, not just the beginning
+- Include timestamps throughout the full duration
+- Be specific — real names, numbers, claims. No filler.
+- Quotes must be exact words spoken.""",
+                        ],
+                        config=types.GenerateContentConfig(
+                            max_output_tokens=8192,
+                            temperature=0.2,
+                        ),
+                    )
+                    summary_raw = resp.text.strip()
+                    # Still store the text transcript for the user
+                    transcript_text = yt_transcript.text
+                    transcript_source = yt_transcript.source
+                    word_count = yt_transcript.word_count
+                    logger.info(f"✅ Path A-Video done ({word_count} words transcript kept)")
+
+                else:
+                    logger.info(f"Path A: text→{MODEL} ({content_type.value})")
+
+                    resp = client.models.generate_content(
+                        model=MODEL,
+                        contents=f"""Summarize this {content_type.value}. Return JSON only.
 
 TITLE: {video_title}
 {f"DURATION: {duration_min:.0f}min" if duration_min else ""}
@@ -308,18 +403,18 @@ TITLE: {video_title}
 {schema}
 
 CRITICAL: Be specific — use real names, numbers, claims from the transcript. No generic filler. Quotes must be exact words spoken.""",
-                    config=types.GenerateContentConfig(
-                        max_output_tokens=8192,
-                        temperature=0.2,
-                    ),
-                )
-                summary_raw = resp.text.strip()
-                transcript_text = yt_transcript.text
-                transcript_source = yt_transcript.source
-                word_count = yt_transcript.word_count
-                logger.info(f"✅ Path A done ({word_count} words)")
+                        config=types.GenerateContentConfig(
+                            max_output_tokens=8192,
+                            temperature=0.2,
+                        ),
+                    )
+                    summary_raw = resp.text.strip()
+                    transcript_text = yt_transcript.text
+                    transcript_source = yt_transcript.source
+                    word_count = yt_transcript.word_count
+                    logger.info(f"✅ Path A done ({word_count} words)")
 
-            # ── Path B: No transcript → video summary only (~30-35s) ──
+            # ── Path B: No/sparse transcript → Gemini video (~30-35s) ──
             else:
                 if progress_callback:
                     progress_callback("AI is watching the video...", 0.15)
@@ -334,17 +429,20 @@ CRITICAL: Be specific — use real names, numbers, claims from the transcript. N
                     model=MODEL,
                     contents=[
                         video_part,
-                        f"""Summarize this video. Return JSON only.
+                        f"""Summarize this video thoroughly. Return JSON only.
 
 TITLE: {video_title}
 {f"DURATION: {duration_min:.0f}min" if duration_min else ""}
 
 {schema}
 
-CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact words.""",
+CRITICAL: This is a {duration_min:.0f}-minute video. Be comprehensive — cover the ENTIRE video, not just the beginning.
+- Include timestamps throughout the full duration
+- Be specific — real names, numbers, claims. No filler.
+- Quotes must be exact words spoken.""",
                     ],
                     config=types.GenerateContentConfig(
-                        max_output_tokens=4096,
+                        max_output_tokens=8192,
                         temperature=0.2,
                     ),
                 )
@@ -397,8 +495,22 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
                 url=canonical_url,
             )
 
+            # Count ALL summary output words (not just executive_summary)
+            # for an accurate compression ratio
+            summary_word_count = len(summary_data.get('executive_summary', '').split())
+            for t in summary_data.get('key_takeaways', []):
+                summary_word_count += len(str(t).split())
+            for ch in summary_data.get('chapters', []):
+                if isinstance(ch, dict):
+                    summary_word_count += len(ch.get('summary', '').split())
+                    summary_word_count += len(ch.get('title', '').split())
+            for q in summary_data.get('notable_quotes', []):
+                if isinstance(q, dict):
+                    summary_word_count += len(q.get('text', '').split())
+
             summary_result = Summary(
                 success=True,
+                content_type=content_type,
                 executive_summary=summary_data.get('executive_summary', ''),
                 key_takeaways=summary_data.get('key_takeaways', []),
                 chapters=[],
@@ -406,9 +518,7 @@ CRITICAL: Be specific — real names, numbers, claims. No filler. Quotes = exact
                 topics=summary_data.get('topics', []),
                 action_items=summary_data.get('action_items', []),
                 word_count_original=word_count,
-                word_count_summary=len(
-                    summary_data.get('executive_summary', '').split()
-                ),
+                word_count_summary=summary_word_count,
                 duration_minutes=duration_min,
                 title=video_title,
             )

@@ -232,7 +232,16 @@ class EnhancedSummarizer:
 
                 if result.success:
                     result.word_count_original = word_count
-                    result.word_count_summary = len(result.executive_summary.split())
+                    # Count ALL summary output words for accurate compression ratio
+                    summary_words = len(result.executive_summary.split())
+                    for t in result.key_takeaways:
+                        summary_words += len(str(t).split())
+                    for ch in result.chapters:
+                        summary_words += len(ch.summary.split())
+                        summary_words += len(ch.title.split())
+                    for q in result.notable_quotes:
+                        summary_words += len(q.text.split())
+                    result.word_count_summary = summary_words
                     result.duration_minutes = duration_minutes
                     result.title = title
                     return result

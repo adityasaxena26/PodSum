@@ -83,13 +83,24 @@ def _format_result(result, app_instance):
     transcript = result['transcript']
     summary = result['summary']
 
+    # Calculate words-per-minute to show transcript quality
+    wpm = (transcript.word_count / transcript.duration_minutes
+           if transcript.duration_minutes > 0 else 0)
+    wpm_note = ""
+    if wpm > 0 and wpm < 50:
+        wpm_note = " (sparse captions)"
+    elif wpm >= 50 and wpm < 100:
+        wpm_note = " (partial)"
+    elif wpm >= 100:
+        wpm_note = " (good)"
+
     status = (
         f"**Done!**\n\n"
         f"| | |\n|---|---|\n"
         f"| Source | {transcript.source.value} |\n"
         f"| Platform | {transcript.platform} |\n"
         f"| Duration | {transcript.duration_minutes:.1f} min |\n"
-        f"| Words | {transcript.word_count:,} |\n"
+        f"| Words | {transcript.word_count:,}{wpm_note} |\n"
         f"| Content Type | {summary.content_type.value} |\n"
         f"| Compression | {summary.compression_ratio:.1f}x |"
     )
