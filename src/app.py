@@ -67,6 +67,8 @@ _ERROR_MAP = {
     "gemini failed after retries": "The AI service failed to respond. Please try again shortly.",
     "json parse failed": "The AI returned an unexpected response. Please try again.",
     "empty transcript": "Could not extract any text from this content.",
+    "all methods failed": "Could not access this video's content. This can happen when YouTube blocks cloud server access. Check the logs for details on which methods were tried.",
+    "sign in to confirm": "YouTube is blocking access from this server. The app tried captions API, Gemini transcription, and audio download — all were blocked. Try a different video or check that GEMINI_API_KEY is set correctly.",
 }
 
 

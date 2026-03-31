@@ -186,11 +186,14 @@ class MultiPlatformFetcher:
         if progress_callback:
             progress_callback("Detecting platform", 0.05)
         
+        # Track tier errors so the final error message shows what was tried
+        tier_errors = []
+
         # TIER 1: Try platform transcripts (if enabled and not forced to audio)
         if self.prefer_transcripts and not force_audio:
             if progress_callback:
                 progress_callback("Checking for existing transcript", 0.1)
-            
+
             result = self._try_platform_transcript(url, platform)
             if result.success:
                 logger.info(f"✅ Got transcript from {result.source.value}")
@@ -198,8 +201,8 @@ class MultiPlatformFetcher:
                     progress_callback("Transcript fetched", 1.0)
                 return result
 
-            tier1_error = result.error
-            logger.info(f"Tier 1 transcript failed: {tier1_error}")
+            tier_errors.append(f"Captions API: {result.error}")
+            logger.info(f"Tier 1 failed: {result.error}")
 
             # TIER 1.5: Gemini transcription (YouTube URL → googleapis.com → transcript)
             # Gemini natively processes YouTube URLs via Google's internal infra.
@@ -215,13 +218,29 @@ class MultiPlatformFetcher:
                     if progress_callback:
                         progress_callback("Transcript fetched", 1.0)
                     return result
-                logger.warning(f"Tier 1.5 Gemini transcription failed: {result.error}")
+                tier_errors.append(f"Gemini transcription: {result.error}")
+                logger.warning(f"Tier 1.5 failed: {result.error}")
             elif platform == Platform.YOUTUBE:
+                tier_errors.append("Gemini: GEMINI_API_KEY not set")
                 logger.warning("⚠️ GEMINI_API_KEY not set — skipping Gemini transcription")
 
-        # TIER 2: Audio fallback (for non-YouTube platforms)
+        # TIER 2: Audio fallback
         logger.info("Falling back to audio download + transcription...")
-        return self._audio_fallback(url, platform, progress_callback)
+        result = self._audio_fallback(url, platform, progress_callback)
+        if result.success:
+            return result
+
+        tier_errors.append(f"Audio download: {result.error}")
+
+        # All tiers failed — return a combined error so the user knows what was tried
+        combined = " | ".join(tier_errors)
+        logger.error(f"All transcript tiers failed: {combined}")
+        return TranscriptResult(
+            success=False,
+            platform=platform.value,
+            url=url,
+            error=f"All methods failed: {combined}"
+        )
     
     def _get_gemini_client(self):
         """Lazy-load and reuse a single Gemini client (singleton per fetcher)."""
@@ -493,10 +512,10 @@ class MultiPlatformFetcher:
             )
 
         except Exception as e:
-            logger.error(f"Gemini transcription failed: {e}")
+            logger.error(f"Gemini transcription failed: {type(e).__name__}: {e}")
             return TranscriptResult(
                 success=False, platform="youtube", url=canonical_url,
-                error=f"Gemini transcription failed: {e}"
+                error=f"Gemini transcription: {type(e).__name__}: {e}"
             )
 
     def _fetch_spotify_transcript(self, url: str) -> TranscriptResult:

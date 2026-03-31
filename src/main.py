@@ -568,9 +568,10 @@ TARGET: ~{target_words} words total. Cover the ENTIRE video. Use specific names,
 
         except json.JSONDecodeError as e:
             logger.warning(f"JSON parse failed: {e}")
+            logger.warning(f"Raw response (first 500 chars): {summary_raw[:500] if summary_raw else 'empty'}")
             return None
         except Exception as e:
-            logger.warning(f"Combined Gemini failed: {e}")
+            logger.error(f"Combined Gemini failed: {type(e).__name__}: {e}")
             return None
 
     def summarize_file(
