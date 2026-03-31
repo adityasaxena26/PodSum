@@ -159,6 +159,20 @@ class PodcastSummarizerV2:
         if _cached_transcript:
             transcript_result = _cached_transcript
             logger.info(f"Reusing transcript from fast path: {transcript_result.word_count} words")
+        elif _gemini_error:
+            # The combined path already tried transcript + video and BOTH failed.
+            # Don't waste 5-15 seconds retrying the same doomed transcript tiers.
+            logger.info("Skipping redundant transcript retry — combined path already tried")
+            error_msg = _gemini_error
+            return {
+                'success': False,
+                'error': error_msg,
+                'transcript': TranscriptResult(
+                    success=False, url=url, platform="youtube",
+                    error="Transcript unavailable (all methods tried by combined path)"
+                ),
+                'summary': None
+            }
         else:
             if progress_callback:
                 progress_callback("Fetching transcript...", 0.1)
@@ -169,9 +183,15 @@ class PodcastSummarizerV2:
             )
 
         if not transcript_result.success:
+            # Include the Gemini video error if available — otherwise the user
+            # only sees "transcript failed" with no mention of the video path
+            # that was also tried (and might have a more useful error message).
+            error_msg = f"Transcript fetch failed: {transcript_result.error}"
+            if _gemini_error:
+                error_msg += f" | Gemini video path also failed: {_gemini_error}"
             return {
                 'success': False,
-                'error': f"Transcript fetch failed: {transcript_result.error}",
+                'error': error_msg,
                 'transcript': transcript_result,
                 'summary': None
             }
@@ -658,10 +678,20 @@ TARGET: ~{target_words} words total. Cover the ENTIRE video. Use specific names,
         except json.JSONDecodeError as e:
             logger.warning(f"JSON parse failed: {e}")
             logger.warning(f"Raw response (first 500 chars): {summary_raw[:500] if summary_raw else 'empty'}")
-            return None
+            return {
+                'success': False,
+                'error': f"Gemini returned invalid JSON: {e}",
+                'transcript': yt_transcript if yt_transcript else None,
+                'summary': None,
+            }
         except Exception as e:
             logger.error(f"Combined Gemini failed: {type(e).__name__}: {e}")
-            return None
+            return {
+                'success': False,
+                'error': f"Gemini video analysis failed: {type(e).__name__}: {e}",
+                'transcript': yt_transcript if yt_transcript else None,
+                'summary': None,
+            }
 
     def summarize_file(
         self,
