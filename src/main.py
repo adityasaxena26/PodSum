@@ -59,7 +59,7 @@ from src.summarization.summarizer import (
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 
 # Centralized model config — change here or via env vars
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 class PodcastSummarizerV2:
     """

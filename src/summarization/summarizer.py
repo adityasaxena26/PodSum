@@ -153,7 +153,7 @@ class EnhancedSummarizer:
             )
 
         self.provider = "gemini"
-        self.gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        self.gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
         self._gemini_client = None
 
         logger.info(f"Using provider: gemini ({self.gemini_model})")
