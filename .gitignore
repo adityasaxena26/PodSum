@@ -27,3 +27,7 @@ node_modules/
 
 .env
 .env/
+
+# Virtual environments (any name starting with venv, incl. odd whitespace)
+venv*/
+.venv/
