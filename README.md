@@ -1,8 +1,8 @@
 # Podcast Summarizer v2.0
 
-> Multi-platform video & podcast summarizer with intelligent fallback and dual LLM support.
+> Multi-platform video & podcast summarizer with intelligent fallback, powered by Google Gemini.
 
-Summarize content from **YouTube, Vimeo, Twitter, TikTok, Spotify, and 1000+ more sites** using AI. Supports both **Google Gemini** (recommended) and **Groq** as LLM providers.
+Summarize content from **YouTube, Vimeo, Twitter, TikTok, SoundCloud, and 1000+ more sites** using AI, or summarize a local audio/video file.
 
 ---
 
@@ -14,30 +14,22 @@ Summarize content from **YouTube, Vimeo, Twitter, TikTok, Spotify, and 1000+ mor
 pip install -r requirements.txt
 ```
 
+You also need FFmpeg for audio downloads and local files (see [Troubleshooting](#troubleshooting)).
+
 ### 2. Set API Key
 
-**Option A — Google Gemini (recommended):**
-
-Get a free key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+Get a free Gemini key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 
 ```bash
 export GEMINI_API_KEY='your-key-here'
 ```
 
-**Option B — Groq:**
-
-Get a free key at [console.groq.com](https://console.groq.com/keys)
-
-```bash
-export GROQ_API_KEY='your-key-here'
-```
-
-Or add them to a `.env` file in the project root.
+Or add it to a `.env` file in the project root.
 
 ### 3. Run
 
 ```bash
-# YouTube video (uses captions — instant)
+# YouTube video
 python -m src.main https://www.youtube.com/watch?v=VIDEO_ID
 
 # Any supported site
@@ -58,25 +50,11 @@ python -m src.app
 
 ---
 
-## LLM Providers
+## LLM
 
-The app auto-selects the best available provider, or you can force one with `--provider`:
-
-| Provider | Model | Context Window | Speed | Free Tier | Notes |
-|----------|-------|---------------|-------|-----------|-------|
-| **Gemini** | `gemini-2.5-flash-lite` | 1M tokens | Fast | 15 RPM, 1M TPM | Handles 4+ hour podcasts in a single call |
-| **Groq** | `llama-3.3-70b-versatile` (primary) / `llama-3.1-8b-instant` (chunked) | 128K tokens | Fast | 6K TPM | Uses chunked processing for long content |
-
-```bash
-# Auto-select (default — prefers Gemini)
-python -m src.main URL
-
-# Force a specific provider
-python -m src.main URL --provider gemini
-python -m src.main URL --provider groq
-```
-
-If Gemini quota is exhausted, the app automatically falls back to Groq.
+| Provider | Model | Context Window | Notes |
+|----------|-------|---------------|-------|
+| **Gemini** | `gemini-2.5-flash` (override with `GEMINI_MODEL`) | 1M tokens | Can read YouTube videos directly when captions are missing |
 
 ---
 
@@ -90,10 +68,9 @@ Options:
   --output FILE, -o      Save to file (.md or .json)
   --file FILE, -f        Summarize a local audio/video file
   --title TITLE, -t      Custom title override
-  --provider PROVIDER    LLM provider: auto, gemini, groq (default: auto)
-  --force-audio          Skip platform captions, use Whisper
+  --force-audio          Skip transcript APIs, download audio and use Whisper
   --transcript-only      Only fetch transcript, no summarization
-  --whisper-model MODEL  Whisper model: tiny, base, small, medium, large-v2, large-v3 (default: large-v3)
+  --whisper-model MODEL  Whisper model: tiny, base, small, medium, large-v2, large-v3 (default: small)
   --quiet, -q            Minimal output
 ```
 
@@ -109,11 +86,11 @@ python -m src.main URL --format bullets --output notes.md
 # JSON output
 python -m src.main URL --output data.json
 
-# Transcript only (no API key needed)
+# Transcript only
 python -m src.main URL --transcript-only
 
-# Force audio transcription with a smaller Whisper model
-python -m src.main URL --force-audio --whisper-model small
+# Force audio transcription with a larger Whisper model
+python -m src.main URL --force-audio --whisper-model medium
 ```
 
 ---
@@ -145,11 +122,14 @@ markdown = app.format_markdown(result['transcript'], result['summary'])
 
 ## Supported Platforms
 
-**Tier 1 — Platform Transcripts (free, instant):**
-- YouTube (captions API)
+**YouTube:**
+- Captions via `youtube-transcript-api` (free, instant — works locally, usually blocked from cloud servers)
+- Gemini transcription / video understanding (works from cloud servers)
+- Audio download + Whisper as a last resort
 
-**Tier 2 — Audio Download + Whisper (fallback):**
-- Vimeo, Twitter/X, TikTok, Spotify, SoundCloud, Twitch, Facebook, Instagram, Dailymotion, and 1000+ more via yt-dlp
+**Everything else — Audio Download + Whisper:**
+- Vimeo, Twitter/X, TikTok, SoundCloud, Twitch, Facebook, Instagram, Dailymotion, and 1000+ more via yt-dlp
+- Spotify only works for episodes yt-dlp can download (no DRM-protected content, no transcript API)
 
 **Local Files:**
 - Audio: MP3, WAV, M4A, FLAC, OGG
@@ -192,43 +172,52 @@ The summarizer auto-detects content type and adapts its output:
 INPUT: URL or local file
          |
          v
-  TIER 1: Platform Check
-  YouTube? -> Fetch captions (free, instant)
-         |
-     Found? --YES--> SUMMARIZE
-         |
-        NO
-         v
-  TIER 2: Audio Fallback
-  1. Download audio (yt-dlp)
-  2. Transcribe (faster-whisper)
+  YouTube URL? ──YES──> FAST PATH (one Gemini call)
+         |              1. Fetch captions + video metadata in parallel
+         |              2. Captions good (>50 words/min)?
+         |                   YES -> Gemini summarizes the text
+         |                          (very long videos: Gemini watches the video)
+         |                   NO  -> Gemini watches the video directly
+         |              Success? ──YES──> OUTPUT
+         |                 |
+         NO                NO (fall back)
+         v                 v
+  TRANSCRIPT FETCH (tiers tried in order)
+  1. Gemini transcription  (YouTube only)
+  2. YouTube captions API
+  3. Download audio (yt-dlp) + transcribe (faster-whisper)
          |
          v
   SUMMARIZE
   1. Detect content type
-  2. Gemini: single call (1M context)
-     Groq: chunked processing if needed
+  2. Long transcripts (>8,000 words): sample intro, middle sections, outro
+  3. Gemini single call (1M context), retries with backoff on rate limits
          |
          v
   OUTPUT: Markdown / JSON
   Summary, chapters, quotes, takeaways
 ```
 
+Results are cached in memory (last 32 URL + format combinations), so repeat requests return instantly.
+
 ---
 
 ## Project Structure
 
 ```
-PodsumV2/
+PodSum/
 ├── src/
-│   ├── main.py                    # CLI application
+│   ├── main.py                    # Orchestrator + CLI
 │   ├── app.py                     # Gradio web UI
 │   ├── ingestion/
 │   │   └── multi_platform.py      # Multi-platform transcript fetcher
 │   └── summarization/
-│       └── summarizer.py          # LLM summarizer (Gemini + Groq)
+│       └── summarizer.py          # Gemini summarizer
+├── Dockerfile
+├── docker-compose.yml
+├── deploy.sh                      # Deploy to Google Cloud Run
 ├── requirements.txt
-├── .env                           # API keys
+├── .env                           # API keys (not committed)
 └── README.md
 ```
 
@@ -240,8 +229,11 @@ PodsumV2/
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GEMINI_API_KEY` | One of these | Google Gemini API key (recommended) |
-| `GROQ_API_KEY` | is required | Groq API key (fallback) |
+| `GEMINI_API_KEY` | Yes | Google Gemini API key |
+| `GEMINI_MODEL` | No | Gemini model to use (default: `gemini-2.5-flash`) |
+| `YOUTUBE_API_KEY` | No | YouTube Data API v3 key, used to fetch video title and duration |
+| `WHISPER_MODEL` | No | Whisper model for the web UI (default: `small`) |
+| `PORT` | No | Web UI port (default: `7860`) |
 
 ### Whisper Models
 
@@ -253,7 +245,24 @@ PodsumV2/
 | `medium` | Slow | High | ~5GB |
 | `large-v3` | Slowest | Best | ~5GB |
 
-CLI default: `large-v3` | Web UI default: `base`
+Default: `small` (CLI and web UI)
+
+---
+
+## Deployment
+
+**Docker:**
+```bash
+docker-compose up --build
+# Open http://localhost:7860
+```
+The `small` Whisper model is baked into the image to avoid a slow first request.
+
+**Google Cloud Run:**
+```bash
+./deploy.sh
+```
+Requires the `gcloud` CLI, a selected GCP project, and `GEMINI_API_KEY` in your environment or `.env`.
 
 ---
 
@@ -265,21 +274,19 @@ CLI default: `large-v3` | Web UI default: `base`
 | Audio download (yt-dlp) | Free |
 | Whisper transcription | Free (local) |
 | Gemini API | Free tier available |
-| Groq API | Free tier available |
 
 ---
 
 ## Troubleshooting
 
-**"No API key set"** — Set at least one:
+**"No API key set"** — Set your Gemini key:
 ```bash
-export GEMINI_API_KEY='your-key'   # or
-export GROQ_API_KEY='your-key'
+export GEMINI_API_KEY='your-key'
 ```
 
-**"Gemini quota exhausted"** — The app auto-falls back to Groq. Or wait for daily quota reset.
+**"Gemini quota exhausted"** — Wait for the quota to reset or upgrade your Gemini plan.
 
-**"No transcript available"** — The app automatically falls back to audio download + Whisper transcription.
+**"No transcript available"** — The app automatically falls back to audio download + Whisper transcription. On cloud servers YouTube often blocks captions and audio downloads; Gemini transcription is the reliable path there.
 
 **"FFmpeg not found"** — Install it:
 ```bash
@@ -292,10 +299,8 @@ sudo apt install ffmpeg
 
 **"CUDA out of memory"** — Use a smaller Whisper model:
 ```bash
-python -m src.main URL --whisper-model small
+python -m src.main URL --whisper-model base
 ```
-
-**Slow summarization on Groq** — Groq's free tier has tight rate limits (6K TPM), requiring delays between chunks for long podcasts. Use Gemini instead, or upgrade to Groq's Dev tier.
 
 ---
 
