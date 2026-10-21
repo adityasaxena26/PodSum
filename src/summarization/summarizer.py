@@ -129,6 +129,74 @@ def _count_summary_words(data: dict) -> int:
     return total
 
 
+# ── Smart transcript windowing ─────────────────────────────
+# For transcripts longer than this, send a strategic sample to Gemini
+# instead of the full text. This dramatically cuts input tokens
+# (and therefore latency) while preserving summary quality.
+# Shared by the combined Gemini path (main.py) and the 2-step path.
+_WINDOW_THRESHOLD_WORDS = 8000  # ~10K tokens
+
+
+def _window_transcript(text: str, max_words: int = _WINDOW_THRESHOLD_WORDS) -> tuple:
+    """Return a strategically sampled transcript that fits within max_words.
+
+    Returns:
+        (windowed_text, was_windowed) tuple to avoid re-splitting.
+
+    Strategy:
+      - First 15% of words (intro / context setting)
+      - Evenly spaced samples from the middle 70%
+      - Last 15% of words (conclusion / wrap-up)
+
+    This preserves the narrative arc while cutting 60-80% of tokens
+    for very long transcripts. For a 30-min video (~4,500 words) this
+    is a no-op; it only kicks in for 60+ min content.
+    """
+    words = text.split()
+    total = len(words)
+    if total <= max_words:
+        return text, False
+
+    intro_size = int(max_words * 0.15)
+    outro_size = int(max_words * 0.15)
+    middle_budget = max_words - intro_size - outro_size
+
+    intro = words[:intro_size]
+    outro = words[-outro_size:]
+
+    # Sample evenly from the middle section
+    middle_words = words[intro_size:total - outro_size]
+
+    if len(middle_words) <= middle_budget:
+        middle = middle_words
+    else:
+        # Pick evenly-spaced chunks (500 words each) from the middle
+        chunk_size = 500
+        num_chunks = max(1, middle_budget // chunk_size)
+        step = len(middle_words) // num_chunks
+        middle = []
+        for i in range(num_chunks):
+            start = i * step
+            middle.extend(middle_words[start:start + chunk_size])
+            if len(middle) >= middle_budget:
+                break
+        middle = middle[:middle_budget]
+
+    return (' '.join(intro) + ' [...] ' + ' '.join(middle)
+            + ' [...] ' + ' '.join(outro)), True
+
+
+# ── Adaptive output token limits ───────────────────────────
+# Smaller formats don't need 8192 tokens. Lower caps = faster generation.
+_FORMAT_MAX_TOKENS = {
+    SummaryFormat.QUICK: 2048,
+    SummaryFormat.BULLETS: 2048,
+    SummaryFormat.CHAPTERS: 4096,
+    SummaryFormat.DETAILED: 8192,
+    SummaryFormat.EXECUTIVE: 2048,
+}
+
+
 class EnhancedSummarizer:
     """
     Intelligent summarizer using Google Gemini (1M token context).
@@ -155,54 +223,6 @@ class EnhancedSummarizer:
     _INITIAL_RETRY_DELAY = 1.0   # Start at 1 second
     _MAX_RETRY_DELAY = 30.0      # Cap at 30 seconds
     _BACKOFF_MULTIPLIER = 2.0    # Double each retry
-
-    # Smart transcript windowing: same as main.py combined path
-    _WINDOW_THRESHOLD_WORDS = 8000
-
-    # Adaptive output token limits per format
-    _FORMAT_MAX_TOKENS = {
-        SummaryFormat.QUICK: 2048,
-        SummaryFormat.BULLETS: 2048,
-        SummaryFormat.CHAPTERS: 4096,
-        SummaryFormat.DETAILED: 8192,
-        SummaryFormat.EXECUTIVE: 2048,
-    }
-
-    @staticmethod
-    def _window_transcript(text: str, max_words: int = 8000) -> tuple:
-        """Strategic transcript sampling for long content.
-        Returns (windowed_text, was_windowed) to avoid re-splitting.
-        Keeps intro (15%), evenly-spaced middle samples (70%), and outro (15%).
-        """
-        words = text.split()
-        total = len(words)
-        if total <= max_words:
-            return text, False
-
-        intro_size = int(max_words * 0.15)
-        outro_size = int(max_words * 0.15)
-        middle_budget = max_words - intro_size - outro_size
-
-        intro = words[:intro_size]
-        outro = words[-outro_size:]
-        middle_words = words[intro_size:total - outro_size]
-
-        if len(middle_words) <= middle_budget:
-            middle = middle_words
-        else:
-            chunk_size = 500
-            num_chunks = max(1, middle_budget // chunk_size)
-            step = len(middle_words) // num_chunks
-            middle = []
-            for i in range(num_chunks):
-                start = i * step
-                middle.extend(middle_words[start:start + chunk_size])
-                if len(middle) >= middle_budget:
-                    break
-            middle = middle[:middle_budget]
-
-        return (' '.join(intro) + ' [...] ' + ' '.join(middle)
-                + ' [...] ' + ' '.join(outro)), True
 
     def __init__(
         self,
@@ -279,13 +299,13 @@ class EnhancedSummarizer:
             logger.info(f"Detected content type: {content_type.value}")
 
         # Smart windowing for long transcripts — cuts input tokens dramatically
-        input_transcript, windowed = self._window_transcript(
-            transcript, self._WINDOW_THRESHOLD_WORDS
+        input_transcript, windowed = _window_transcript(
+            transcript, _WINDOW_THRESHOLD_WORDS
         )
         if windowed:
             logger.info(
                 f"Windowed transcript: {word_count:,} → "
-                f"~{self._WINDOW_THRESHOLD_WORDS:,} words"
+                f"~{_WINDOW_THRESHOLD_WORDS:,} words"
             )
 
         # Build prompt with (possibly windowed) transcript
@@ -305,7 +325,7 @@ class EnhancedSummarizer:
         from google.genai import types
 
         # Adaptive output tokens: smaller formats generate faster
-        max_tokens = self._FORMAT_MAX_TOKENS.get(format, 8192)
+        max_tokens = _FORMAT_MAX_TOKENS.get(format, 8192)
 
         for attempt in range(max_retries):
             try:
