@@ -322,10 +322,7 @@ class MultiPlatformFetcher:
         
         if platform == Platform.YOUTUBE:
             return self._fetch_youtube_transcript(url)
-        
-        elif platform == Platform.SPOTIFY:
-            return self._fetch_spotify_transcript(url)
-        
+
         # Add more platforms as APIs become available
         
         return TranscriptResult(
@@ -555,16 +552,6 @@ class MultiPlatformFetcher:
                 success=False, platform="youtube", url=canonical_url,
                 error=f"Gemini transcription: {type(e).__name__}: {e}"
             )
-
-    def _fetch_spotify_transcript(self, url: str) -> TranscriptResult:
-        """Fetch Spotify transcript (placeholder for future implementation)"""
-        # Spotify has been adding transcripts but API access is limited
-        return TranscriptResult(
-            success=False,
-            platform="spotify",
-            url=url,
-            error="Spotify transcript API not yet available"
-        )
 
     def _yt_data_api_metadata(self, video_id: str, api_key: str) -> dict:
         """Fetch video metadata via YouTube Data API v3 (works with API key)."""
